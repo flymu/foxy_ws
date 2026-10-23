@@ -1,0 +1,11 @@
+# colcon 构建产物
+build_x86/
+install_x86/
+
+# 运行日志
+log/
+logs/
+
+# Python
+__pycache__/
+*.pyc
