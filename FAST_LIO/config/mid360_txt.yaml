@@ -1,0 +1,38 @@
+common:
+    time_sync_en: false          # LiDAR and IMU timestamps come from the same clock in this dump
+    time_offset_lidar_to_imu: 0.0
+
+preprocess:
+    lidar_type: 2                # read as PointCloud2 with per-point time; see tools/livox_txt_to_pcd.py
+    scan_line: 4                 # MID-360; unused here because per-point times are given
+    blind: 0.5
+    timestamp_unit: 0            # the converter writes the per-point offset in seconds
+    point_filter_num: 3
+    feature_extract_enable: false
+
+mapping:
+    max_iteration: 3
+    filter_size_surf: 0.5
+    filter_size_map: 0.5
+    cube_side_length: 1000
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    fov_degree:    360
+    det_range:     100.0
+    extrinsic_est_en:  false      # ground-plane normal matches IMU gravity to 0.5 deg, so identity is right
+    gravity_align: true           # the sensor is mounted ~47 deg off vertical; level the world frame
+    gravity_freeze: true          # stop re-estimating the gravity direction mid-run; the dog's gait
+                                  # walks it off (2.8 deg tilt -> ~1 m z-drift over the 130 m loop)
+    recovery_en: true             # watchdog: recover from match-collapse divergence instead of running away
+    max_platform_speed: 2.0       # m/s; the robot dog never exceeds ~1.8 m/s, so a held 2 m/s is divergence
+    extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+    extrinsic_R: [ 1, 0, 0,
+                   0, 1, 0,
+                   0, 0, 1]
+
+publish:
+    dense_publish_en: true
+
+runtime_pos_log_enable: false

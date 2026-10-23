@@ -6,6 +6,12 @@ install_x86/
 log/
 logs/
 
+# FAST_LIO / HBA 编译产物与输出
+build/
+Log/
+PCD/
+data/
+
 # Python
 __pycache__/
 *.pyc

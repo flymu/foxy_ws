@@ -1,0 +1,33 @@
+common:
+    time_sync_en: false          # ONLY turn on when external time synchronization is really not possible
+    time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init.
+                                  # This param takes effect no matter what time_sync_en is. If the offset is not known exactly, set 0.0
+
+preprocess:
+    lidar_type: 1                # 1 Livox serials, 2 Velodyne, 3 Ouster, 4 MARSIM
+    scan_line: 4
+    blind: 0.5
+    point_filter_num: 3
+    feature_extract_enable: false
+
+mapping:
+    max_iteration: 3
+    filter_size_surf: 0.5
+    filter_size_map: 0.5
+    cube_side_length: 1000
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    fov_degree:    360
+    det_range:     100.0
+    extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+    extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+    extrinsic_R: [ 1, 0, 0,
+                   0, 1, 0,
+                   0, 0, 1]
+
+publish:
+    dense_publish_en: true       # false: fewer points in the registered world-frame cloud
+
+runtime_pos_log_enable: false    # write timing/state logs under Log/
