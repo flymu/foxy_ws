@@ -12,6 +12,9 @@ Log/
 PCD/
 data/
 
+# gtsam 源码自带的测试数据目录不受上一条 data/ 排除影响
+!HBA/3rdparty/gtsam/**/data/
+
 # Python
 __pycache__/
 *.pyc

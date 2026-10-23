@@ -12,7 +12,7 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 | 雷达启停 / 录包 / 建图 | `start_livox.sh` `stop_livox.sh` `record_bag.sh` `point_lio_start.sh` `test_point_lio.sh` `run_combined_test.sh` |
 | LIO / NDT 定位 / 规划（自研 ROS2 包装） | `point_lio_ros2/` `scan_planner_ros2/` `src/livox_ros_driver2`（msg-only 补丁版） |
 | FAST_LIO（hku-mars 基础上的本地版：IMU 无姿态导出兼容、离线 HBA 扫描导出工具） | `FAST_LIO/`（源码快照，未含 doc/PCD/build，GPL-2.0） |
-| HBA 离线回环优化（hku-mars 基础上的本地修改） | `HBA/`（源码快照，未含 3rdparty/data/build，GPL-2.0；gtsam 依赖需另行克隆到 `3rdparty/`） |
+| HBA 离线回环优化（hku-mars 基础上的本地修改） | `HBA/`（源码快照，未含 data/build，GPL-2.0）；gtsam 4.1.1 已附带在 `HBA/3rdparty/gtsam`（源码快照，剔除 .git 与构建产物，BSD） |
 | 精度评估 / 地图绘图 / 可视化辅助 | `eval_loc.py` `plot_map.py` `prep_map_viz.py` `viz_helper.py` |
 | RViz 巡逻台配置 | `live_stack.rviz`（2D Goal Pose 遛狗 + 相机画面）`livox.rviz` `point_lio.rviz` |
 | DDS 传输配置 | `fastdds_udp_only.xml` `cyclonedds_eth1.xml` |
