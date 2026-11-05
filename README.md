@@ -11,7 +11,7 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 | 狗控制桥（工作站→cmd_vel→SDK2 RPC） | `go2_bridge.py` `go2_bridge_start.sh`（部署到 Orin）`motion_test.py` |
 | 四足解算位姿桥（固件 /lf/sportmodestate→`/go2/odom`，两段接力） | `go2_odom_bridge.py`（Orin，第1段：cyclone 钉 eth1 直订主板）`go2_odom_republish.py`（第2段：默认 FastDDS 栈跨栈透传给工作站）`go2_odom_start.sh`（两段一键启停）`dog_odom_sim.py`（离线验证器） |
 | 巡逻栈一键启停（foxy-live 容器内） | `live_stack_start.sh` `live_stack_stop.sh` `pose_dump.py`（位姿连续性检查） |
-| **独立避障否决层**（最后防线，P0-S） | `obstacle_veto.py`（数据流：`/cmd_vel_raw`→否决→`/go2/cmd_vel`）`veto_calib_probe.py`（安装几何标定）`capture_frames.py`（原始帧采集）`test_veto_offline.py`（离线回放测试，狗不上电可跑）`veto_selfmask_probe.py`（体素掩膜法，已弃用留档）`probe_twist_stream.py` `probe_observer.py`（DDS 流诊断探针，50Hz 流"断流"定责用）
+| **独立避障否决层**（最后防线，P0-S） | `obstacle_veto.py`（数据流：`/cmd_vel_intent`→speed_adapter→`/cmd_vel_raw`→否决→`/go2/cmd_vel`）`veto_core.py`（G1 无 ROS 决策核心：R1 真距离/R2 不增速/R3 戳闸）`speed_adapter.py`（运动适配器：起步地板 0.25/停步死区，G1 起 veto 不再越权抬速）`bridge_core.py` + `go2_bridge.py` v4（R4 停车锁存仲裁）`test_veto_regression.py`（R1-R4 无 ROS 回归，53 断言）`test_veto_offline.py`（bag 回放集成测试，非零退出码）`e2e_replay_run.sh`（E2E 回放链一键 runner，docker exec -d 脱离会话）`orin_deploy/push_safety.sh`（G1 副本一键推 Orin，狗断电期间改完防忘推）`veto_calib_probe.py`（安装几何标定）`capture_frames.py`（原始帧采集）`veto_status_snoop.py`（Orin 上拉 /veto/status——daemon 瞎）`tf_snoop.py` `veto_selfmask_probe.py`（体素掩膜法，已弃用留档）`probe_twist_stream.py` `probe_observer.py`（DDS 流诊断探针，50Hz 流"断流"定责用）
 `peek_status.py`（String 话题旁观器，/veto/status /loc/health 快速回读）`peek_imu.py`（/livox/imu 旁听：频率/模长/与先验法线夹角） |
 | 相机接入（前摄拍照 RPC + RTSP 流桥） | `go2_photo_test.py` `go2_rtsp_test.py` `go2_camera_bridge.py`（Orin）`go2_camera_republish.py`（工作站）`go2_videohub_probe.py` `con_notify_probe.py` `probe_proto.py` `probe2.py` `describe_rtsp.py` |
 | 雷达启停 / 录包 / 建图 | `start_livox.sh` `stop_livox.sh` `record_bag.sh` `point_lio_start.sh` `test_point_lio.sh` `run_combined_test.sh` |
@@ -49,18 +49,39 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 背景：规划器障碍图唯一数据源是实时点云，驱动病时静默冻结、定位游走时障碍图错位，
 且 SportClient.Move 旁路了狗自带 AI 避障——多次撞家具，无独立防线兜底。
 
-本节点是**最后一道闸**：只看原始 `/livox/lidar` + 静态安装几何，独立于
-LIO/定位/规划器。数据流 `scan_planner -r /cmd_vel:=/cmd_vel_raw` → veto → `/go2/cmd_vel`。
+本节点是**最后一道闸**：只看原始雷达点云 + 静态安装几何，独立于
+LIO/定位/规划器。数据流 `scan_planner -r /cmd_vel:=/cmd_vel_intent` →
+`speed_adapter`（G1 起：起步地板/停步死区在这里）→ `/cmd_vel_raw` → veto → `/go2/cmd_vel`。
+
+**G1 修复批（2026-11-05，评审 R1-R4 全落地，53 项回归全绿）**：
+- **R1 距离压缩**：旧式在倾斜传感器系里取 hypot(x,y)，前向距离被压 ×cos47°≈0.68
+  （实测 veto 读 0.62 vs 真值 0.91，胶带复核）→ 半径其实等效 1.47m，狗 0.9m 外
+  对无害物刹停。修正为正交水平基 `hypot(vh·f, vh·l)`，半径 1.0 现在就是真 1.0m。
+- **R2 提权违规**：旧版把消解后的残速"抬回"0.25（放大越权）→ 删除。残速低于
+  起步阈值一律归零（保守停车）；起步地板移交给 speed_adapter（适配在前、否决在后）。
+- **R3 时效盲区**：旧版"刚收到"当"刚采集"，旧帧/重复帧能无限续命 → 加戳闸
+  （采集年龄 >2.5s 拒 + 戳不前进拒；回放模式 `-p stamp_check:=false`）。
+- **R4 停车竞争**：桥的 stop 和速度共用可覆盖槽位 → bridge_core.CmdArbiter
+  （hi 指令通道永远优先、stop 即刻锁存 halt 直到 resume/姿态指令、看门狗瞬态不锁存）。
+- 决策逻辑抽成 `veto_core.py`/`bridge_core.py`（无 ROS 依赖），
+  `test_veto_regression.py` 53 项断言离线可跑（多倾角×多方位×已知距离、
+  不放大性质测试、戳闸、停车锁存），失败非零退出。
+- **E2E bag 回放实测（e2e_replay_run.sh，隔离 domain+关戳闸）**：50Hz 假规划器
+  恒推 0.25m/s，输出满 50Hz；拦截 90 拍中位距离 **0.91m（贴合胶带复核真值 0.7-0.9m）**；
+  首 2s 无云期 100% 零（早启熔断）、bag 停后 100% 零（STALE 熔断），TEST_EXIT=0。
+- `orin_deploy/push_safety.sh`：G1 副本一键 scp 到 Orin——狗断电期间本地改完防忘推，
+  **下次上电先跑它再实弹**。
 
 - 几何：Mid360 尾部桅杆**前下斜装 47°**（n_up=[-0.733,0.0001,0.680]，h=0.486m，
   veto_calib_probe.py 从 campus_map 静止段标定）；频带离地 **0.20-0.75m**（下沿
   0.20：场地坡度+标定残差 ±4cm 会把地板壳漏进 0.05-0.15，净空处也永远拦截——
-  11-03 实弹诊断）；前方 ±60° <1.0m 拦截、侧后 <0.55m 拦截，只消"朝向障碍"的
-  速度分量（保沿墙滑行/脱离），原地转向永不拦（逃生），<0.30m 全消平动。
+  11-03 实弹诊断）；前方 ±60° <1.0m 拦截（R1 修正后=真米数）、侧后 <0.55m 拦截，
+  只消"朝向障碍"的速度分量（保沿墙滑行/脱离），原地转向永不拦（逃生），
+  <0.30m 全消平动。
 - 自体掩膜：传感器正下方小方盒（桅杆座/背的紧簇，行走+静止双验证）；腿/侧腹
   自遮挡零回波。体素持久性掩膜法会混入起点环境（51%），弃用。
-- 熔断：>1s 无有效云（点数≥2000 且散布≥1m 双判据，防空云假新鲜）→ 全零。
-  节点死 = cmd 流断 = 桥 0.5s 看门狗停车，失效安全。
+- 熔断：>1s 无有效云（点数≥2000、散布≥1m、**采集戳新鲜且前进**三判据，
+  防空云假新鲜/旧帧续命）→ 全零。节点死 = cmd 流断 = 桥 0.5s 看门狗停车，失效安全。
 - QoS：cmd 链全 BEST_EFFORT depth 1（最新指令赢；RELIABLE 重传在执行器被雷达
   反序列化拖住时无意义）。**go2_bridge.py 的 /go2/cmd_vel 订阅已同步改 BE，
   Orin 上的部署副本需 rsync 更新后 veto 才能生效**（BE pub 对 RELIABLE sub
@@ -80,9 +101,20 @@ LIO/定位/规划器。数据流 `scan_planner -r /cmd_vel:=/cmd_vel_raw` → ve
   `ros2 topic pub /veto/cmd std_msgs/String "{data: recalib}"` 手动重标、
   `"{data: prior}"` 回退先验。状态行 `imu=ok a=0.98 q=1 slope=0.4`：
   slope=地板法线与重力夹角（≈地面坡度）。
-- 离线测试（狗不上电）：`ros2 bag play campus_map --rate 2.0` + veto 带
-  `-r /go2/cmd_vel:=/veto/cmd_out` + `test_veto_offline.py 125`。
-  健康看 `/veto/status`（state/age_ms/blk/calib/计数）。
+- 离线测试（狗不上电，G1 后链路变了——veto 吃 `/livox/points2` 而 bag 里只有
+  CustomMsg，必须有 relay；bag 戳是旧 epoch，必须关戳闸；隔离 domain 防真机串台）：
+  1) WS 容器构建并启动 relay：`colcon build --packages-select livox_relay`（一次性）
+     然后 `ros2 run livox_relay relay_node`
+  2) `ROS_DOMAIN_ID=77 ros2 bag play /home/mu/bags/campus_map`
+  3) `ROS_DOMAIN_ID=77 python3 obstacle_veto.py --ros-args
+     -r /go2/cmd_vel:=/veto/cmd_out -p stamp_check:=false`
+  4) `ROS_DOMAIN_ID=77 timeout -s INT 260 python3 test_veto_offline.py`
+  一键版（推荐，**必须 docker exec -d 脱离会话**——普通 exec/nohup 的后台任务
+  会被宿主会话的 SIGTERM 连坐杀树）:
+    sg docker -c 'docker exec -d foxy-live bash /home/mu/foxy_ws/e2e_replay_run.sh'
+  完成标记 /tmp/e2e.done，取结果: sg docker -c 'docker exec foxy-live cat /tmp/e2e.test.log'
+  快速回归（无 ROS 无 bag）：`python3 test_veto_regression.py`（53 断言，秒级）。
+  健康看 `/veto/status`（state/age_ms/blk/calib/计数/stamprej）。
 
 ## 注意
 

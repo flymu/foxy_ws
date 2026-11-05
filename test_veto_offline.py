@@ -5,10 +5,18 @@
   1. 假规划器：50Hz 恒发 (0.25,0,0) → /cmd_vel_raw（veto 的输入）
   2. 记录器：订阅 /veto/cmd_out + /veto/status 记时间线
   3. 结束打印统计：全零/受限/放行占比、拦截距离-方位分布、末段 STALE 行为
-配套：veto 节点要带 remap 跑（别碰真 /go2/cmd_vel）:
-  python3 ~/foxy_ws/obstacle_veto.py --ros-args -r /go2/cmd_vel:=/veto/cmd_out
-用法（容器内，另开 ros2 bag play campus_map）:
-  timeout -s INT 260 python3 ~/foxy_ws/test_veto_offline.py [运行秒数]
+退出码（G1：测试失败必须非零退出）：0=过 2=没收到输出 3=首段无云期没熔断
+配套完整回放链（2026-11-05 G1 起，veto 吃 /livox/points2，bag 里只有
+CustomMsg——必须有 relay；bag 戳是录制时刻的旧 epoch——必须关戳闸）：
+  # 终端1: relay（需先在 WS 容器里 colcon build livox_relay）
+  source /home/mu/foxy_ws/install_x86/setup.bash && ros2 run livox_relay relay_node
+  # 终端2: bag（隔离 domain，防真机订阅者串台）
+  ROS_DOMAIN_ID=77 ros2 bag play /home/mu/bags/campus_map
+  # 终端3: veto（同 domain + remap 别碰真 /go2/cmd_vel + 关戳闸）
+  ROS_DOMAIN_ID=77 python3 ~/foxy_ws/obstacle_veto.py \
+      --ros-args -r /go2/cmd_vel:=/veto/cmd_out -p stamp_check:=false
+  # 终端4: 本测试（同 domain）
+  ROS_DOMAIN_ID=77 timeout -s INT 260 python3 ~/foxy_ws/test_veto_offline.py [秒]
 """
 import sys
 import time
@@ -73,9 +81,12 @@ def main():
     # ---- 统计 ----
     cmds = rec["cmd"]
     print("\n==== veto 离线测试汇总（时长 %.0fs）====" % (time.monotonic() - rec["t0"]))
+    rc = 0
     if not cmds:
         print("!! 未收到任何 /veto/cmd_out — veto 没跑起来或 remap 错")
-        return
+        node.destroy_node()
+        rclpy.shutdown()
+        sys.exit(2)
     dt = cmds[-1][0] - cmds[0][0]
     print("输出 %d 条 / %.0fs = %.0fHz" % (len(cmds), dt, len(cmds) / max(0.1, dt)))
     full_zero = sum(1 for c in cmds if abs(c[1]) < 1e-6 and abs(c[2]) < 1e-6
@@ -118,8 +129,12 @@ def main():
                         and abs(c[3]) < 1e-6)
         print("首 2s: %d 条, 全零 %d — 期望 100%%（无云不动）"
               % (len(head), head_zero))
+        if head_zero < len(head):
+            print("!! 首段无云期未全零 — 熔断失效，见 obstacle_veto 设计4")
+            rc = 3
     node.destroy_node()
     rclpy.shutdown()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

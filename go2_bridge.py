@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-go2_bridge.py v3 — Go2 控制桥（跑在 Orin Nano 上）
+go2_bridge.py v4 — Go2 控制桥（跑在 Orin Nano 上）
 工作站 WiFi DDS ──► rclpy 本桥 ──► unitree_sdk2py RPC（eth1 狗内部网）──► Go2 sport 服务
 
 2026-10-22 实测结论:
@@ -9,20 +9,28 @@ go2_bridge.py v3 — Go2 控制桥（跑在 Orin Nano 上）
   (robot_state 的 ServiceSwitch 会 5201 并回退; /api/sport/request 话题在 mcf 下不受理)
 - SelectMode("mcf") 交还给 App/遥控
 
+2026-11-05 G1（评审 R4）: 停车与速度的槽位竞争修复——仲裁逻辑抽到
+bridge_core.CmdArbiter（hi 指令通道永远先于速度、'stop' 即刻锁存 halt、
+看门狗瞬态不锁存），本文件只做 ROS 接线 + RPC 执行。
+
 话题（ROS2 domain 0, 走 WiFi）:
   订阅 /go2/cmd_vel  geometry_msgs/Twist   连续速度指令（限幅 |vx|,|vy|≤0.5m/s, |vyaw|≤1rad/s）
   订阅 /go2/cmd      std_msgs/String       balance/damp/stop/standup/standdown/recovery/
-                                            switchjoystick_on/off/devon/devoff
-  发布 /go2/status   std_msgs/String       心跳 1Hz: 当前模式 + 最近指令结果
+                                            resume/switchjoystick_on/off/devon/devoff
+  发布 /go2/status   std_msgs/String       心跳 1Hz: 当前模式 + halt/丢速计数 + 最近指令结果
 
 安全:
-  - 看门狗: 连续速度模式 0.5s 无新 cmd_vel → 自动 Move(0,0,0)
+  - 看门狗: 连续速度模式 0.5s 无新 cmd_vel → 自动 Move(0,0,0)（瞬态，不锁存）
+  - stop 锁存: 'stop' 后速度一律丢弃，直到显式 'resume'（或姿态/模式类指令
+    balance/standup/recovery/devon——操作员主动接管即解除）。评审 R4 实锤：
+    旧版 stop 和速度共用一个可覆盖槽位，持续速度流能立刻覆盖停车。
   - 速度先限幅; 所有 RPC 结果码进 status, 出错即告警日志
 """
 import json
 import threading
 import time
 
+import bridge_core
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -78,11 +86,9 @@ class Go2Bridge(Node):
         self.mode = self._check_mode()
         self.get_logger().info('motion mode: %s' % self.mode)
 
-        # ---- 指令队列 + RPC 工作线程 ----
+        # ---- 指令仲裁 + RPC 工作线程（G1/R4：仲裁在 bridge_core，锁在本类）----
         self._cv = threading.Condition()
-        self._pending = None
-        self._moving = False
-        self._last_vel_t = 0.0
+        self.arb = bridge_core.CmdArbiter(WATCHDOG_S)
         self._stop_thread = False
         self._last_result = 'idle'
         self._last_mode_check = time.monotonic()
@@ -115,8 +121,7 @@ class Go2Bridge(Node):
         vy = clamp(msg.linear.y, MAX_VXY)
         vyaw = clamp(msg.angular.z, MAX_VYAW)
         with self._cv:
-            self._pending = ('move', vx, vy, vyaw)
-            self._last_vel_t = time.monotonic()
+            self.arb.push_vel(vx, vy, vyaw, time.monotonic())
             self._cv.notify()
 
     def _on_cmd(self, msg):
@@ -125,20 +130,14 @@ class Go2Bridge(Node):
             self.get_logger().warn('未知指令: %r（可用: %s）' % (msg.data, ','.join(CMDS)))
             return
         with self._cv:
-            self._pending = ('cmd', cmd)
+            self.arb.push_cmd(cmd)   # 'stop' 在此即刻锁存 halt（不等 RPC 执行）
             self._cv.notify()
 
     # ---------- 工作线程：串行执行 RPC ----------
     def _work(self):
         while not self._stop_thread:
-            item = None
             with self._cv:
-                if self._pending is not None:
-                    item = self._pending
-                    self._pending = None
-                elif self._moving and (time.monotonic() - self._last_vel_t) > WATCHDOG_S:
-                    self._moving = False
-                    item = ('move', 0.0, 0.0, 0.0)  # 看门狗自动停车
+                item = self.arb.next_item(time.monotonic())
             if item is None:
                 # 空闲时周期性刷新模式（RPC 最多阻塞1s, 不进 executor 线程）
                 if time.monotonic() - self._last_mode_check > MODE_CHECK_S:
@@ -157,12 +156,14 @@ class Go2Bridge(Node):
         ts = time.strftime('%H:%M:%S')
         if item[0] == 'move':
             code = self.sport.Move(item[1], item[2], item[3])  # noreply, 0=已发
-            self._moving = True
             self._last_result = 'move(%.2f,%.2f,%.2f) code=%d' % (item[1], item[2], item[3], code)
             return
-        self._moving = False  # 单条指令接管, 退出连续速度模式
         cmd = item[1]
 
+        if cmd == 'resume':
+            # 纯解锁（halt 已在入队时刻解除），无 RPC——只是给 status 一个回执
+            self._last_result = 'resume ack @%s' % ts
+            return
         if cmd == 'devon':
             code = self.ms.SelectMode(SPORT)[0]
             self._last_result = 'SelectMode(sport) code=%d @%s' % (code, ts)
@@ -188,7 +189,9 @@ class Go2Bridge(Node):
     # ---------- 状态心跳 ----------
     def _pub_status(self):
         s = String()
-        s.data = 'mode=%s | moving=%s | %s' % (self.mode, self._moving, self._last_result)
+        s.data = 'mode=%s | moving=%s | halt=%s drop=%d | %s' % (
+            self.mode, self.arb.moving, self.arb.halted, self.arb.dropped_vel,
+            self._last_result)
         self.pub_status.publish(s)
 
     def shutdown_stop(self):
@@ -199,7 +202,7 @@ class Go2Bridge(Node):
             pass
 
 
-CMDS = ('balance', 'damp', 'stop', 'standup', 'standdown', 'recovery',
+CMDS = ('balance', 'damp', 'stop', 'resume', 'standup', 'standdown', 'recovery',
         'switchjoystick_on', 'switchjoystick_off', 'devon', 'devoff')
 
 

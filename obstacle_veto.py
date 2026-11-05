@@ -17,11 +17,13 @@
   3. 检查几何：离地高 h∈[band_lo,band_hi] 的点，前方 ±60° 扇区 <sector_r
      拦截，侧后 <ring_r 拦截；拦截只消速度"朝向障碍"的分量（保留沿墙滑行
      与脱离分量），原地转向永远放行（逃生通道）。极近(<0.3m)才全消平动。
-     残速量化（11-05 蠕行实弹补丁）：消解后残速落在 (死区, v_min_walk) 是狗
-     执行不了的"幽灵速度"——起步阈值实测 0.20~0.25，残速 0.21 全程原地罚站。
-     处置：残速向前且方向明确 → 沿安全方向抬回 v_min_walk（真滑行）；否则
-     归零（明确停车，含后退残速——宁停不倒车）。狗的速度空间物理上只有两档。
-  4. 断供即熔断：>cloud_timeout 无有效云（点数/散布双判据，防驱动病空云
+     G1（2026-11-05，评审 R1/R2）定案的决策语义在 veto_core.py：
+       R1 dh=正交水平基下真距离（旧式前向压缩 ×0.68 已修）→ 半径就是真米数；
+       R2 只抑制不放大——消解过的残速低于起步阈值(v_min_walk)→归零（保守
+          停车），未消解的指令原样放行；起步/停步地板归上游 speed_adapter.py；
+       R3 采集时效双闸：stamp 年龄超限或不前进 → 不计新鲜（防旧帧/重复帧
+          无限续命）；回放模式用 -p stamp_check:=false 显式关门。
+  4. 断供即熔断：>cloud_timeout 无有效云（点数/散布/戳三判据，防驱动病空云
      假新鲜）→ 全零输出。无数据=不动。节点死=cmd流断=桥看门狗停车，天然失效安全。
   5. Mid360 内置 IMU 重力对齐（/livox/imu，g 单位，静止读数=+g 向上）：
      开机静止窗直接给出法线初值——趴着也给得对，不依赖地板可见性；
@@ -31,13 +33,13 @@
      静置>120s 自动重修。IMU 缺席/断流优雅回退纯雷达行为。
   6. /veto/cmd "recalib" 手动重标、"prior" 回退先验。
 
-接线（D1+D2 落地 2026-11-05，本节点驻 Orin）：
-  scan_planner(WS) -r /cmd_vel:=/cmd_vel_raw →(WiFi 小报文)→ 本节点(Orin)
-  → /go2/cmd_vel(本地链路) → Orin 桥。
+接线（D1+D2 落地 2026-11-05，本节点驻 Orin；speed_adapter 2026-11-05 G1 加入）：
+  scan_planner(WS) -r /cmd_vel:=/cmd_vel_intent → speed_adapter(WS，起步地板)
+  →(WiFi 小报文) /cmd_vel_raw → 本节点(Orin) → /go2/cmd_vel(本地链路) → Orin 桥。
   点云来源 = /livox/points2（Orin 上 livox_relay 的输出：同为原始雷达点，
   仅 CustomMsg→PointCloud2 格式转换，中继与驱动同机走 SHM 不占 WiFi）。
   /livox/lidar 的 WiFi 订阅者从此只剩 point_lio 一个（D1 写侧棘轮根治）。
-离线测试 remap：--ros-args -r /go2/cmd_vel:=/veto/cmd_out
+离线测试 remap：--ros-args -r /go2/cmd_vel:=/veto/cmd_out -p stamp_check:=false
 用法（Orin 上，unitree 用户）:
   bash /home/unitree/patrol_safety_start.sh    # relay + veto 一键启动
 """
@@ -48,15 +50,12 @@ from collections import deque
 
 import numpy as np
 import rclpy
+import veto_core
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu, PointCloud2
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
-
-# ---------------- 先验（veto_calib_probe.py 从 campus_map 静止段标定）----------------
-PRIOR_N = np.array([-0.7330, 0.0001, 0.6802])
-PRIOR_H = 0.486
 
 
 class ObstacleVeto(Node):
@@ -64,22 +63,36 @@ class ObstacleVeto(Node):
         super().__init__("obstacle_veto")
         # ---- 参数（全部可 -p 覆盖）----
         p = lambda n, d: self.declare_parameter(n, d).value
-        # 狗身轴心离传感器的水平距离（沿前向）。URDF 实测：传感器地面投影≈躯干中心
-        # （可见躯干顶面跨 s∈[-0.15,+0.15] 恰为 0.376m 躯干全长），取外轮廓中心 +0.05
-        self.body_along = p("body_along", 0.05)
-        self.body_lat = p("body_lat", 0.0)
-        self.self_half = np.array([p("self_half_x", 0.25), p("self_half_y", 0.15)])
-        self.self_z = (p("self_z_lo", -0.30), p("self_z_hi", 0.35))
-        # 离地高频带。band_lo=0.20：2026-11-03 实弹诊断——场地坡度+标定残差让
-        # 地板壳漏进 h 0.05-0.15（拦截点 51% 是地板，净空处也永远 BLOCK），
-        # 0.20 能盖住 1.25m 近场内 ~5° 坡度 + 标定误差；代价是 <20cm 低矮物
-        # 不可见（11-03 撞的桌/沙发均 >30cm，可接受）
-        self.band = (p("band_lo", 0.20), p("band_hi", 0.75))
-        self.sector_half = math.radians(p("sector_half_deg", 60.0))
-        self.sector_r = p("sector_r", 1.0)
-        self.ring_r = p("ring_r", 0.55)
-        self.touch_r = p("touch_r", 0.30)                    # 极近全消平动
-        self.near_keep = p("near_keep", 1.25)                # 入库水平距上限
+        # 决策参数打包给 veto_core（G1：决策逻辑无 ROS 化，可离线回归）
+        self.prm = veto_core.Params(
+            band=(p("band_lo", 0.20), p("band_hi", 0.75)),
+            self_half=(p("self_half_x", 0.25), p("self_half_y", 0.15)),
+            self_z=(p("self_z_lo", -0.30), p("self_z_hi", 0.35)),
+            # band_lo=0.20：2026-11-03 实弹诊断——场地坡度+标定残差让地板壳漏进
+            # h 0.05-0.15（拦截点 51% 是地板，净空处也永远 BLOCK），0.20 能盖住
+            # 1.25m 近场内 ~5° 坡度+标定误差；代价是 <20cm 低矮物不可见
+            # （11-03 撞的桌/沙发均 >30cm，可接受）
+            sector_half=math.radians(p("sector_half_deg", 60.0)),
+            # R1 语义：sector_r 现在是真·水平米。旧度量前向压缩 ×0.68，实测
+            # sector_r=1.0 等效 1.47m 真距（狗 0.9m 外对无害物刹停的过度保守
+            # 一半来自这里）。修正后 1.0 就是 1.0。高速巡航时应改为速度相关。
+            sector_r=p("sector_r", 1.0),
+            ring_r=p("ring_r", 0.55),
+            touch_r=p("touch_r", 0.30),                    # 极近全消平动
+            near_keep=p("near_keep", 1.25),                # 入库水平距上限
+            vx_dead=p("vx_dead", 0.02),                    # 分量消解死区
+            # 残速地板（11-05 蠕行实弹）：狗起步阈值实测 0.20~0.25，残速
+            # 0.19~0.22 狗原地罚站。G1 定案：消解过的残速低于此→归零；
+            # 抬升越权已删（R2），滑行由上游 speed_adapter 给足速度实现
+            v_min_walk=p("v_min_walk", 0.25),
+            stamp_check=p("stamp_check", True),            # R3 采集时效闸
+            stamp_max_age=p("stamp_max_age", 2.5),         # 健康基线 0.15s
+        )
+        # ---- 安装几何（狗身轴心离传感器的水平距离：URDF 实测传感器地面投影
+        # ≈躯干中心（可见躯干顶面跨 s∈[-0.15,+0.15] 恰为 0.376m 躯干全长），取外轮廓中心 +0.05）
+        self.geom = veto_core.Geom(veto_core.PRIOR_N, veto_core.PRIOR_H,
+                                   body_along=p("body_along", 0.05),
+                                   body_lat=p("body_lat", 0.0))
         self.window_s = p("cloud_window", 0.5)
         self.timeout_s = p("cloud_timeout", 1.0)
         self.min_pts = p("min_pts", 2000)                    # 有效帧下限(健康~2万)
@@ -91,21 +104,12 @@ class ObstacleVeto(Node):
         self.imu_track = p("imu_track", True)             # 锚定后 IMU 增量跟踪倾斜
         self.posture_rearm_deg = p("posture_rearm_deg", 5.0)  # 倾斜累计超此→重修
         self.recheck_s = p("recheck_s", 120.0)            # 静置复检周期(s)
-        self.vx_dead = p("vx_dead", 0.02)                    # 分量消解死区
-        # 残速量化地板（11-05 蠕行实弹）：狗起步阈值实测 0.20~0.25，消解残速
-        # 0.19~0.22 狗原地罚站——低于此速的残速要么抬回此值真滑行，要么归零
-        self.v_min_walk = p("v_min_walk", 0.25)
-
-        self.n = PRIOR_N / np.linalg.norm(PRIOR_N)
-        self.h_sensor = PRIOR_H
-        # 前向/左侧水平基向量（随 n 更新）
-        self.f = self._horiz(np.array([1.0, 0.0, 0.0]))
-        self.l = np.cross(self.n, self.f)
-        self.body_c = self.body_along * self.f + self.body_lat * self.l
 
         # ---- 状态 ----
         self.win = deque()            # (t, (M,2) float32: dh, az)
         self.last_fresh_t = None
+        self.last_stamp = None        # R3：最近一次通过时效闸的采集戳
+        self.last_stamp_warn = 0.0
         self.raw = deque()            # 标定用原始帧（仅准静止时采集）
         self.t_first = time.monotonic()
         self.calib_done = False
@@ -113,8 +117,8 @@ class ObstacleVeto(Node):
         self.next_calib_t = self.t_first + self.calib_after_s
         self.calib_frames = p("calib_frames", 55)   # 收满静止帧即精修(≈5.5s@10Hz)
         # ---- IMU 重力对齐状态 ----
-        self.g = self.n.copy()        # 重力"向上"方向估计（传感器系）
-        self.g_at_fit = self.n.copy() # 上次锚定（精修/对齐）时的 g
+        self.g = self.geom.n.copy()   # 重力"向上"方向估计（传感器系）
+        self.g_at_fit = self.geom.n.copy()  # 上次锚定（精修/对齐）时的 g
         self.last_fit_t = self.t_first
         self.imu_n = 0
         self.quiet_n = 0
@@ -125,22 +129,25 @@ class ObstacleVeto(Node):
         self.boot_aligned = False
         self.calib_src = "prior"
         self.stats = {"block_sector": 0, "block_ring": 0, "pass": 0,
-                      "stale": 0, "frames": 0, "fresh_frames": 0}
+                      "stale": 0, "frames": 0, "fresh_frames": 0,
+                      "stamp_rej": 0}
         self.last_state = "INIT"
         self.last_blk = None
 
         # ---- 话题 ----
         qb = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                         history=HistoryPolicy.KEEP_LAST, depth=10)
+        # 速度指令深度1（终于和注释一致了，评审 R3 顺带修）：纯"最新指令赢"，
+        # 丢旧无所谓；深度10 会把过期指令排队重放，RELIABLE 更有楔死前科
+        qcmd = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                          history=HistoryPolicy.KEEP_LAST, depth=1)
         qr = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                         history=HistoryPolicy.KEEP_LAST, depth=5)
         # D2 修复：吃中继的 PointCloud2（np.frombuffer 零拷贝），不再是
         # rclpy ctypes 逐点反序列化 ~190ms/帧 的 CustomMsg 直订受害者
         self.create_subscription(PointCloud2, "/livox/points2", self.on_cloud, qb)
         self.create_subscription(Imu, "/livox/imu", self.on_imu, qb)
-        # 深度1 BEST_EFFORT=纯"最新指令赢"：速度流丢旧无所谓，RELIABLE 的
-        # NACK/重传机制在执行器被雷达反序列化周期拖住时会楔死流（实测~35s）
-        self.create_subscription(Twist, "/cmd_vel_raw", self.on_cmd, qb)
+        self.create_subscription(Twist, "/cmd_vel_raw", self.on_cmd, qcmd)
         self.create_subscription(String, "/veto/cmd", self.on_cmd_string, qr)
         # BE 输出：桥 0.5s 断流看门狗兜底，丢一拍无妨；RELIABLE 有楔死风险
         self.pub_cmd = self.create_publisher(
@@ -151,42 +158,13 @@ class ObstacleVeto(Node):
         self.create_timer(1.0, self.publish_status)
 
         self.get_logger().info(
-            "obstacle_veto 就绪: 先验 n=[%.3f,%.3f,%.3f] h=%.3f, 前扇±%.0f°/%.2fm "
-            "环%.2fm, 超时%.1fs, 残速地板%.2f" % (
-                self.n[0], self.n[1], self.n[2], self.h_sensor,
-                math.degrees(self.sector_half), self.sector_r,
-                self.ring_r, self.timeout_s, self.v_min_walk))
-
-    # ---------------- 几何 ----------------
-    def _horiz(self, v):
-        """向量投到水平面并归一。"""
-        v = v - (v @ self.n) * self.n
-        return v / np.linalg.norm(v)
-
-    def _ingest(self, P):
-        """一帧 20k 点 → 频带内、近场、非自体的 (dh, az)。"""
-        h = P @ self.n + self.h_sensor
-        m = (h > self.band[0]) & (h < self.band[1])
-        # 自体掩膜：传感器正下方小方盒（桅杆座+背，静止/行走双验证）
-        m &= ~((np.abs(P[:, 0]) < self.self_half[0]) &
-               (np.abs(P[:, 1]) < self.self_half[1]) &
-               (P[:, 2] > self.self_z[0]) & (P[:, 2] < self.self_z[1]))
-        if not m.any():
-            return np.zeros((0, 2), np.float32)
-        Q = P[m]
-        rel = Q - self.body_c
-        vh = rel - (rel @ self.n)[:, None] * self.n
-        dh = np.hypot(vh[:, 0], vh[:, 1])
-        keep = dh < self.near_keep
-        if not keep.any():
-            return np.zeros((0, 2), np.float32)
-        v = vh[keep]
-        az = np.arctan2(v @ self.l, v @ self.f)
-        return np.column_stack([dh[keep], az]).astype(np.float32)
-
-    def _radius(self, az):
-        """方位相关的拦截半径：前扇区远、侧后环近。"""
-        return np.where(np.abs(az) < self.sector_half, self.sector_r, self.ring_r)
+            "obstacle_veto 就绪(G1): n=[%.3f,%.3f,%.3f] h=%.3f, 前扇±%.0f°/%.2fm(真距) "
+            "环%.2fm, 超时%.1fs, 戳闸%s(%.1fs), 残速地板%.2f(低于即归零,不抬升)" % (
+                self.geom.n[0], self.geom.n[1], self.geom.n[2], self.geom.h,
+                math.degrees(self.prm.sector_half), self.prm.sector_r,
+                self.prm.ring_r, self.timeout_s,
+                "开" if self.prm.stamp_check else "关", self.prm.stamp_max_age,
+                self.prm.v_min_walk))
 
     # ---------------- 回调 ----------------
     def on_cloud(self, m):
@@ -194,6 +172,21 @@ class ObstacleVeto(Node):
         # 走 buffer 协议零拷贝（旧版 CustomMsg 每帧 ~190ms ctypes 逐点反序列
         # 化把所有 python 订阅者钉死在 5.3Hz；此路彻底绕开）
         self.stats["frames"] += 1
+        # R3 采集时效闸：刚收到≠刚采集。旧帧延迟到达/重复帧无限续命是评审
+        # 实锤的盲区；驱动冻结(戳不前进)同样拒。回放模式显式 -p stamp_check:=false
+        stamp_s = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+        ok, why = veto_core.stamp_ok(stamp_s, self.last_stamp, time.time(),
+                                     self.prm)
+        if not ok:
+            self.stats["stamp_rej"] += 1
+            now = time.monotonic()
+            if now - self.last_stamp_warn > 10.0:
+                self.last_stamp_warn = now
+                self.get_logger().warn(
+                    "[R3] 拒帧(%s): 戳龄 %.2fs, 连拒 %d — 驱动冻结/时钟域异常?"
+                    % (why, time.time() - stamp_s, self.stats["stamp_rej"]))
+            return
+        self.last_stamp = stamp_s
         if m.width < self.min_pts or m.point_step != 16:
             return  # 空云/病云/异格式不计新鲜
         arr = np.frombuffer(m.data, dtype=np.float32).reshape(-1, 4)
@@ -203,7 +196,7 @@ class ObstacleVeto(Node):
         self.stats["fresh_frames"] += 1
         now = time.monotonic()
         self.last_fresh_t = now
-        sl = self._ingest(P)
+        sl = veto_core.ingest(P, self.geom, self.prm)
         if len(sl):
             self.win.append((now, sl))
         # 建议保留窗口
@@ -242,39 +235,13 @@ class ObstacleVeto(Node):
                 pts = np.vstack([s for _, s in self.win])
             else:
                 pts = np.zeros((0, 2), np.float32)
-            state, blk = "PASS", None
-            if len(pts):
-                blockers = pts[pts[:, 0] < self._radius(pts[:, 1])]
-                if len(blockers):
-                    blockers = blockers[np.argsort(blockers[:, 0])][:3]  # 最近3个
-                    state = "BLOCK_RING" if abs(blockers[0, 1]) > self.sector_half \
-                            else "BLOCK_SECTOR"
-                    if blockers[0, 0] < self.touch_r:
-                        vx = vy = 0.0
-                    else:
-                        for dh, az in blockers:
-                            u = np.array([math.cos(az), math.sin(az)])
-                            v = np.array([vx, vy])
-                            toward = v @ u
-                            if toward > self.vx_dead:
-                                v = v - toward * u
-                                vx, vy = float(v[0]), float(v[1])
-                        # 残速量化（11-05 实弹）：残速 ∈ (死区, v_min_walk) 是
-                        # 狗执行不了的幽灵速度（原地罚站）。向前且非噪声 → 沿
-                        # 安全方向抬回 v_min_walk 真滑行；其余（含后退）归零。
-                        sp = math.hypot(vx, vy)
-                        if sp < self.v_min_walk:
-                            if sp > self.vx_dead and vx >= -self.vx_dead:
-                                s = self.v_min_walk / sp
-                                vx, vy = vx * s, vy * s
-                            else:
-                                vx = vy = 0.0
-                    blk = (float(blockers[0, 0]), float(math.degrees(blockers[0, 1])))
-                    self.stats["block_ring" if "RING" in state else "block_sector"] += 1
-                else:
-                    self.stats["pass"] += 1
+            # 决策在 veto_core（G1 无 ROS 核心，可回归）：R1 真距离 + R2 只抑制
+            # 不放大（残速低于起步阈值→归零，不再抬升）
+            vx, vy, state, blk = veto_core.apply_veto(vx, vy, pts, self.prm)
+            if state == "PASS":
+                self.stats["pass"] += 1
             else:
-                self.stats["pass"] += 1  # 近场干净
+                self.stats["block_ring" if "RING" in state else "block_sector"] += 1
         self.last_state, self.last_blk = state, blk
         out.linear.x, out.linear.y, out.angular.z = vx, vy, wz
         self.pub_cmd.publish(out)
@@ -287,7 +254,7 @@ class ObstacleVeto(Node):
             self.next_calib_t = time.monotonic()
             self.get_logger().info("重标定：采 %d 帧静止帧后精修..." % self.calib_frames)
         elif m.data == "prior":
-            self._set_ground(PRIOR_N, PRIOR_H, "prior")
+            self._set_ground(veto_core.PRIOR_N, veto_core.PRIOR_H, "prior")
             self.get_logger().info("已回退先验")
 
     # ---------------- IMU 重力对齐 ----------------
@@ -305,7 +272,7 @@ class ObstacleVeto(Node):
         if not self.imu_quiet:
             return  # 步态/搬动等动态中不更新重力方向
         if self.imu_sign is None:
-            self.imu_sign = 1.0 if a @ self.n > 0 else -1.0
+            self.imu_sign = 1.0 if a @ self.geom.n > 0 else -1.0
         up = self.imu_sign * a / max(am, 1e-6)
         self.quiet_n += 1
         # EMA：对齐前快收敛（50帧≈0.3s 残差<1%），对齐后慢跟踪
@@ -318,18 +285,18 @@ class ObstacleVeto(Node):
         if self.imu_track and self.calib_src != "prior":
             R = self._rot_between(self.g, g_new)
             if R is not None:
-                self._apply_ground(R @ self.n)
+                self._apply_ground(R @ self.geom.n)
         self.g = g_new
         # 开机静止窗重力对齐（启动=静止假设）：趴着也给得出正确法线，
         # 不用等 6s 地板拟合，也不怕地板被挡
         if not self.boot_aligned and self.quiet_n >= 50 and now - self.t_first > 2.0:
             self.boot_aligned = True
-            dev = math.degrees(math.acos(min(1.0, abs(self.g @ PRIOR_N))))
+            dev = math.degrees(math.acos(min(1.0, abs(self.g @ veto_core.PRIOR_N))))
             if dev < 15.0:
-                self._set_ground(self.g, PRIOR_H, "imu-boot")
+                self._set_ground(self.g, veto_core.PRIOR_H, "imu-boot")
                 self.get_logger().info(
                     "[imu-boot] 重力对齐: 与先验夹角 %.1f°，法线即刻可用，"
-                    "h 暂用先验 %.3f" % (dev, PRIOR_H))
+                    "h 暂用先验 %.3f" % (dev, veto_core.PRIOR_H))
             else:
                 self.get_logger().warn(
                     "[imu-boot] 重力与先验差 %.1f°>15°（坡道/被搬动?），"
@@ -376,7 +343,7 @@ class ObstacleVeto(Node):
             self.get_logger().warn("[%s] 标定帧不足(%d)，保持先验" % (tag, len(self.raw)))
             return False
         P = np.vstack(list(self.raw))
-        prior = self.n
+        prior = self.geom.n
         h = P @ prior
         sel = np.abs(h - np.percentile(h, 5)) < 0.08
         if sel.sum() < 500:
@@ -401,7 +368,7 @@ class ObstacleVeto(Node):
         if dev < 12 and 0.35 <= hh <= 0.68:
             self._set_ground(nn, hh, "refit-%s" % tag)
             self.get_logger().info("[%s] 地板精修: dev=%.1f° h=%.3fm（先验 %.3f）"
-                                   % (tag, dev, hh, PRIOR_H))
+                                   % (tag, dev, hh, veto_core.PRIOR_H))
             return True
         self.get_logger().warn("[%s] 精修未过校验(dev=%.1f° h=%.2f)，保持先验，15s 后重采重试"
                                % (tag, dev, hh))
@@ -409,14 +376,11 @@ class ObstacleVeto(Node):
 
     def _apply_ground(self, nn):
         """轻量更新几何（n/f/l/体心）——IMU 增量跟踪用，不清窗口、不动锚。"""
-        self.n = nn / np.linalg.norm(nn)
-        self.f = self._horiz(np.array([1.0, 0.0, 0.0]))
-        self.l = np.cross(self.n, self.f)
-        self.body_c = self.body_along * self.f + self.body_lat * self.l
+        self.geom.rebase(nn)
 
     def _set_ground(self, nn, hh, src):
         self._apply_ground(nn)
-        self.h_sensor = float(hh)
+        self.geom.h = float(hh)
         self.calib_src = src
         self.g_at_fit = self.g.copy()   # 锚定当前重力：姿态变化检测的基准
         self.last_fit_t = time.monotonic()
@@ -432,17 +396,18 @@ class ObstacleVeto(Node):
         elif self.last_imu_t is not None and now - self.last_imu_t < 3.0:
             imu = "ok"
             q = str(int(bool(self.imu_quiet)))
-            slope = math.degrees(math.acos(min(1.0, abs(self.g @ self.n))))
+            slope = math.degrees(math.acos(min(1.0, abs(self.g @ self.geom.n))))
         else:
             imu, q, slope = "dead", "-", -1.0
         msg = String()
         msg.data = ("state=%s age_ms=%d win=%d blk=%s calib=%s "
                     "frames=%d fresh=%d pass=%d sector=%d ring=%d stale=%d "
-                    "imu=%s a=%.2f q=%s slope=%.1f try=%d/6"
+                    "stamprej=%d imu=%s a=%.2f q=%s slope=%.1f try=%d/6"
                     % (self.last_state, age, len(self.win),
                        ("dh=%.2f az=%.0f" % self.last_blk) if self.last_blk else "none",
                        self.calib_src, s["frames"], s["fresh_frames"], s["pass"],
                        s["block_sector"], s["block_ring"], s["stale"],
+                       s["stamp_rej"],
                        imu, self.a_mag, q, slope, self.calib_attempts))
         self.pub_status.publish(msg)
 
