@@ -18,3 +18,6 @@ data/
 # Python
 __pycache__/
 *.pyc
+
+# R5 回归运行产物(每轮覆盖,不入库)
+logs_r5/

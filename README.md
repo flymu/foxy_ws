@@ -10,9 +10,11 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 |---|---|
 | 狗控制桥（工作站→cmd_vel→SDK2 RPC） | `go2_bridge.py` `go2_bridge_start.sh`（部署到 Orin）`motion_test.py` |
 | 四足解算位姿桥（固件 /lf/sportmodestate→`/go2/odom`，两段接力） | `go2_odom_bridge.py`（Orin，第1段：cyclone 钉 eth1 直订主板）`go2_odom_republish.py`（第2段：默认 FastDDS 栈跨栈透传给工作站）`go2_odom_start.sh`（两段一键启停）`dog_odom_sim.py`（离线验证器） |
-| 巡逻栈一键启停（foxy-live 容器内） | `live_stack_start.sh` `live_stack_stop.sh` `pose_dump.py`（位姿连续性检查） |
+| 巡逻栈一键启停（foxy-live 容器内） | `live_stack_start.sh` `live_stack_stop.sh` `pose_dump.py`（位姿连续性检查） `doctor.py`（全链路只读体检：各级速率/健康语义，异常非零退出） |
 | **独立避障否决层**（最后防线，P0-S） | `obstacle_veto.py`（数据流：`/cmd_vel_intent`→speed_adapter→`/cmd_vel_raw`→否决→`/go2/cmd_vel`）`veto_core.py`（G1 无 ROS 决策核心：R1 真距离/R2 不增速/R3 戳闸）`speed_adapter.py`（运动适配器：起步地板 0.25/停步死区，G1 起 veto 不再越权抬速）`bridge_core.py` + `go2_bridge.py` v4（R4 停车锁存仲裁）`test_veto_regression.py`（R1-R4 无 ROS 回归，53 断言）`test_veto_offline.py`（bag 回放集成测试，非零退出码）`e2e_replay_run.sh`（E2E 回放链一键 runner，docker exec -d 脱离会话）`orin_deploy/push_safety.sh`（G1 副本一键推 Orin，狗断电期间改完防忘推）`veto_calib_probe.py`（安装几何标定）`capture_frames.py`（原始帧采集）`veto_status_snoop.py`（Orin 上拉 /veto/status——daemon 瞎）`tf_snoop.py` `veto_selfmask_probe.py`（体素掩膜法，已弃用留档）`probe_twist_stream.py` `probe_observer.py`（DDS 流诊断探针，50Hz 流"断流"定责用）
 `peek_status.py`（String 话题旁观器，/veto/status /loc/health 快速回读）`peek_imu.py`（/livox/imu 旁听：频率/模长/与先验法线夹角） |
+| **R5 定位批回归**（冻结回跳/三态健康/解除迟滞/P0-1 续接//initialpose 重种子/B3 规划器门控） | `r5_replay_regression.sh`（五段 bag 回放一键，**必须 docker exec -d**）→ 宿主机 `python3 r5_verify.py` 断言（R5-1 冻结无回跳 / R5-2 健康 1Hz 心跳数据停后仍在 / R5-3 解除迟滞≥3s / R5-4 拒绝与接受续接 / B3 注入 DEGRADED→清目标零速、恢复不追旧目标）；`r5_capture.py`（采集节点）、`r5_seed_pose.py`（/initialpose 注入器）、`dog_odom_sim.py` |
+| 上电部署件（Orin） | `orin_deploy/push_safety.sh`（安全栈+看门狗一键推）`orin_deploy/livox_watchdog.sh`（驱动长跑塌方自愈：速率塌→SIGINT+清SHM+重拉）`orin_deploy/POWERON_CHECKLIST.md`（上电→可信巡逻检查单） |
 | 相机接入（前摄拍照 RPC + RTSP 流桥） | `go2_photo_test.py` `go2_rtsp_test.py` `go2_camera_bridge.py`（Orin）`go2_camera_republish.py`（工作站）`go2_videohub_probe.py` `con_notify_probe.py` `probe_proto.py` `probe2.py` `describe_rtsp.py` |
 | 雷达启停 / 录包 / 建图 | `start_livox.sh` `stop_livox.sh` `record_bag.sh` `point_lio_start.sh` `test_point_lio.sh` `run_combined_test.sh` |
 | LIO / NDT 定位 / 规划（自研 ROS2 包装） | `point_lio_ros2/` `scan_planner_ros2/` `src/livox_ros_driver2`（msg-only 补丁版） |
@@ -34,10 +36,56 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 各自最近 2s 的位移/偏航差分，分歧超阈值 → 判 LIO 病态，`/loc/pose` 切换为
 「最后一致锚点 + 狗航位推算增量」死推，停子图累积（NDT 自然拒绝脏数据）；
 窗口重新一致后无跳变交还 LIO+NDT。狗里程计复位（standup/recovery 重置原点）自动
-识别重建基准，位姿不断裂。健康状态看 `/loc/health`（OK / DEAD_RECKONING）。
+识别重建基准，位姿不断裂。健康状态看 `/loc/health`（R5 起为三态式，见下）。
 触发过的真实场景：livox 驱动长跑发病喂脏点云，LIO 里程计瞬间漂 28m（NDT 闸门兜住）；
 2026-10-31 真机实弹——雷达空云（eff=5）把 LIO 喂飞 23m，看门狗反复切入死推（计数至
 第10次），`/loc/pose` 全程钉在原地不动，下游未被带飞（期间 latch/unlatch 震荡，待加解除迟滞）。
+
+## R5 定位修复批 + B3 规划器门控 + P0-1 断电续接（2026-11-05，评审 R5/R7 前 4 项）
+
+评审（docs/REVIEW_2026-11-05.md）四缺陷全修，源 `point_lio_ros2/src/map_localization_node.cpp`
+与 `scan_planner_ros2/src/scan_planner_node.cpp`：
+
+- **R5-1 冻结回跳**：死推期无狗流时旧代码回跳到**初始锚点**（狗走远后输出瞬移回起点）
+  → 改为保存并保持"最后发布的死推位姿" `T_mb_dr_last_`。
+- **R5-2 三态健康 + 1Hz 心跳**：`/loc/health` 从数据流驱动的两态改成 1Hz 墙钟心跳的
+  `STATE|reason|age_s`（INITIALIZING/OK/STALE/DEGRADED/LOST）——数据停后健康**仍在说**
+  LOST/STALE 而不是沉默（下游才能区分"断流"与"没事"）。
+- **R5-3 解除迟滞（P0-3）**：狗/LIO 重新一致后需 **连续 30 窗且跨度≥3s** 才解除死推
+  （旧 10 窗≈1s，latch/unlatch 震荡）；狗流断供 >0.5s 重建狗缓冲。
+- **P0-1 断电续接**：每 5s 落盘 `(T_mo, 狗位姿)` 到 `persist_path`
+  （默认 `/home/mu/maps/loc_state.txt`，只落健康态）；下次上电狗位姿在 0.5m/0.3rad 内
+  → 直接续接 T_mo 跳过 known-start；超差（狗挪过窝/里程计复位）→ WARN 维持 known-start。
+- **/initialpose 重种子（T_mo 注入 API）**：RViz "2D Pose Estimate"（和 BBS 全局定位
+  种子助手）等价入口——x/y/yaw 取消息、z/roll/pitch 沿用当前，`T_mo=T_mb·T_ob⁻¹`，
+  死推期自动忽略（死推位姿是对的），agree 锚点作废由 NDT 精修接管。
+- **B3 规划器准入门控**：`scan_planner_node` 订 `/loc/health`，**fail-closed**：
+  非 OK / 健康流超时 2.5s / loc 位姿超龄 2.0s → 清目标（新增核心
+  `ScanPlanner::clearTarget()`）+ 显式零速 100Hz 下发 + 不喂里程计不 step + 不喂地图；
+  恢复后 **不自动追旧目标**（goal 复位 -1e9，等操作员重发）且须 OK 持续 ≥1s
+  （11-06 迟滞，见下）；位姿外推封顶 0.25s
+  （旧代码按旧速度无限外推）。
+
+回归：`r5_replay_regression.sh` 五段 bag 回放（~7min，docker exec -d）→
+`python3 r5_verify.py` 断言上述行为（含注入 DEGRADED 的门控响应与续接正反例）。
+
+### 11-06 加固（回归首轮复盘出的两处真缺陷）
+
+- **看门狗假锁（mirror 假阳性）**：快走段 LIO 帧对速度 1.53m/s 刚过旧阈值 1.5 → 误报
+  "狗里程计复位"重建基准 → 重建后狗窗 1.2s vs LIO 窗 2.0s **不等长比较**，行走位移被
+  窗口差顶爆 → mirror 全程一致却在袋 t≈200s 被假锁"位移分歧"3.2s（真机=巡逻中无辜急停）。
+  修复：复位阈值 1.5→**4.0 m/s**（真实复位是米级瞬移；Go2 正常极速≈2m/s）+
+  LIO 同跳排除（狗/LIO 同跳=真实运动或 LIO 修正，不算复位）+
+  **狗/LIO 窗口墙钟等长比较**（跨流匹配必须走墙钟——狗钟与 livox 钟不同源，
+  狗 stamp 不能索引 LIO 缓冲；`StampedPose` 增加接收墙钟字段）。
+- **门控重开迟滞**：健康在 OK/DEGRADED 边界抖动时门控 1Hz 反复开关（每沿 clearTarget），
+  狗会顿挫 → 重开须 **OK 连续保持 ≥1s**（`reopen_hold`，默认 1.0）；关闭方向无迟滞。
+  回归注入窗（DEGRADED@10Hz 叠加真 OK@1Hz）实测旧版 11 关 10 开、新版恰 3 关 2 开。
+- **standalone 库日志级别**：默认 WARN 吞掉 `[clearTarget]` INFO 生效日志 →
+  包装节点 `set_log_level(INFO)`（现场排"不走"必须能看到）。
+- **/initialpose 语义注**：健康跟踪下错误种子会被 NDT 当帧精修拉回真值（位姿不跳是
+  **设计行为**，防 RViz 误点瞬移）；种子冷启动效果由 Run3b（T_mo 注入可见）与
+  BBS Phase 0b 覆盖。回归 34 断言全绿。
 狗里程计通路为两段接力：主板 DDS 只认 CycloneDDS 且钉 eth1（FastDDS 怎么配都收不到），
 该参与者又只在 eth1 多播、工作站发现不了，故由 Orin 上默认 FastDDS 栈的
 `go2_odom_republish.py` 跨栈透传一次，两段一键启停 `go2_odom_start.sh`。

@@ -8,11 +8,14 @@ set -e
 cd "$(dirname "$0")/.."
 FILES="obstacle_veto.py veto_core.py veto_viz.py cloud_sparsify.py \
 go2_bridge.py bridge_core.py go2_avoid_switch.py veto_status_snoop.py tf_snoop.py \
-creep_test.py"
+creep_test.py livox_watchdog.sh"
 echo "== 推送: $FILES"
 scp -q $FILES go2_wifi:/home/unitree/
 echo "== 完成。下次实弹前的开机检查单："
-echo "  1. ssh go2_wifi 'python3 /home/unitree/go2_avoid_switch.py get'  # 自带避障必须 off"
-echo "  2. ssh go2_wifi 'bash /home/unitree/patrol_safety_start.sh [viz]' # relay+veto(G1)"
-echo "  3. 桥: ssh go2_wifi 'bash /home/unitree/go2_bridge_start.sh'      # v4 停车锁存版"
-echo "  4. 狗唤醒后 known-start 重定位（point_lio 位姿已脏）"
+echo "  详见 orin_deploy/POWERON_CHECKLIST.md，顺序概要："
+echo "  1. ssh go2_wifi 'bash -s' < start_livox.sh                     # 雷达"
+echo "  2. ssh go2_wifi 'setsid nohup bash /home/unitree/livox_watchdog.sh >/dev/null 2>&1 < /dev/null &'"
+echo "  3. ssh go2_wifi 'python3 /home/unitree/go2_avoid_switch.py get'  # 自带避障必须 off"
+echo "  4. ssh go2_wifi 'bash /home/unitree/patrol_safety_start.sh [viz]' # relay+veto(G1)"
+echo "  5. 桥: ssh go2_wifi 'bash /home/unitree/go2_bridge_start.sh'      # v4 停车锁存版"
+echo "  6. 狗唤醒后 known-start/续接 重定位（point_lio 位姿已脏）"
