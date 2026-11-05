@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """
-go2_odom_bridge.py — Go2 四足解算位姿桥 v2（Orin 上跑，纯 rclpy/FastDDS 单栈）
+go2_odom_bridge.py — Go2 四足解算位姿桥 v3（Orin 上跑，两段接力第 1 段）
 订阅固件 /lf/sportmodestate (unitree_go/SportModeState, best_effort)
-→ 发布 /go2/odom (nav_msgs/Odometry, best_effort)，供工作站定位节点做
-  四足航位推算融合（LIO 健康裁判 + 退化死推）。
+→ 发布 /go2/odom_src (nav_msgs/Odometry, best_effort)，
+由 go2_odom_republish.py（第 2 段，默认 FastDDS 栈）透传为 /go2/odom 给工作站，
+供定位节点做四足航位推算融合（LIO 健康裁判 + 退化死推）。
 
-为什么不用 SDK2/CycloneDDS 双栈：固件话题在 FastDDS 域里可发现（ros2 topic list
-可见），rclpy 直接订阅即可；SDK2 ChannelSubscriber 路线此前始终收不到回调。
-注意：狗趴下/趴窝（非 sport 状态）时固件对该话题静默属正常——把狗唤醒才有数据。
+为什么必须两段、且本段必须挂 rmw_cyclonedds（2026-10-31 实测定论）:
+  主板 DDS 是 Cyclone 品格、只认 192.168.123.x 内网可达的 locator——
+  rclpy 默认 FastDDS 参与者无论如何配 XML 都完不成与主板的发现
+  （publisher count 恒 0，收不到任何数据）；
+  而 FastDDS 的默认 locator 走默认路由网卡(wlan0)，主板也无法反向完成发现。
+  实测唯一能收到数据的方式 = rmw_cyclonedds + CYCLONEDDS_URI 钉在 eth1
+  （unitree 自带的 /home/unitree/cyclonedds_ws/cyclonedds.xml，20Hz 稳定）。
+  但钉死 eth1 的参与者只在 eth1 广播，工作站（wlan0 网段）永远发现不了它，
+  所以再由默认栈的第 2 段在本机跨栈透传一次。
+启动: bash /home/unitree/go2_odom_start.sh（两段一起，环境变量都在里面）。
+狗趴下/未唤醒时固件对该话题静默属正常——唤醒站起来立即有数据。
 
 帧名: dog_odom / go2_base（独立于 LIO 栈的 map/camera_init/body）。
 时间戳: 用 Orin 本机 now() 重打（LIO 消息戳同样源自 Orin 时钟，下游按各自流的
@@ -38,7 +47,7 @@ class Go2OdomBridge(Node):
                              history=HistoryPolicy.KEEP_LAST, depth=5)
         self.sub = self.create_subscription(
             SportModeState, "/lf/sportmodestate", self.on_state, qos_sub)
-        self.pub = self.create_publisher(Odometry, "/go2/odom", qos_pub)
+        self.pub = self.create_publisher(Odometry, "/go2/odom_src", qos_pub)
         self.n = 0
         self.resets = 0
         self.last_pos = None
@@ -46,7 +55,7 @@ class Go2OdomBridge(Node):
         self.last_log = time.time()
         self.last_rx = time.time()
         self.t_start = time.time()
-        self.get_logger().info("go2_odom_bridge v2 就绪（等 /lf/sportmodestate 数据；"
+        self.get_logger().info("go2_odom_bridge v3 就绪（等 /lf/sportmodestate 数据；"
                                "狗趴着时静默属正常）")
 
     def on_state(self, msg):

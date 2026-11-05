@@ -1,0 +1,155 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+      Splitter Ratio: 0.5
+    Tree Height: 900
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 5
+      Enabled: true
+      Max Intensity: 255
+      Min Intensity: 0
+      Name: 稀疏全景
+      Position Transformer: XYZ
+      Queue Size: 2
+      Selectable: false
+      Size (Pixels): 3
+      Size (m): 0.02
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter Size: 0
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /livox/points_sparse
+      Use Fixed Frame: true
+      Use Rainbow: true
+      Value: true
+    - Alpha: 0.4
+      Cell Size: 0.5
+      Class: rviz_default_plugins/Grid
+      Color: 90; 90; 90
+      Enabled: true
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 16
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Frame Timeout: 1
+      Frames:
+        All Enabled: false
+        livox_frame:
+          Value: true
+        veto_dog:
+          Value: true
+      Marker Alpha: 1
+      Marker Scale: 0.4
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        {}
+      Update Interval: 0
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: RGB8
+      Enabled: true
+      Max Intensity: 1
+      Min Intensity: 0
+      Name: veto频带点
+      Position Transformer: XYZ
+      Queue Size: 2
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.02
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter Size: 0
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /veto_diag/band
+      Use Fixed Frame: true
+      Use Rainbow: true
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Marker Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /veto_diag/boxes
+      Name: 障碍包围盒
+      Namespaces:
+        box: true
+        label: true
+      Queue Size: 10
+      Value: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Default Light: true
+    Fixed Frame: veto_dog
+    Frame Rate: 30
+  Name: current
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+  Transformation Constructor: "rviz_default_plugins::TFConversion"
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 4.5
+      Enable Stereo Rendering: true
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.4
+      Focal Shape: false
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: 0.45
+      Stereo Eye Separation: 0.06
+      Stereo Focal Distance: 1
+      Stereo Swap Eyes: false
+      Target Frame: <Fixed Frame>
+      Yaw: 4.71
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1000
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Width: 1500
+  X: 60
+  Y: 60

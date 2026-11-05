@@ -88,7 +88,12 @@ class Go2Bridge(Node):
         self._last_mode_check = time.monotonic()
         threading.Thread(target=self._work, daemon=True).start()
 
-        self.create_subscription(Twist, '/go2/cmd_vel', self._on_cmd_vel, 10)
+        # cmd_vel 用 BEST_EFFORT：上游 veto 输出 BE（RELIABLE 重传机制在
+        # 执行器被雷达反序列化拖住时会楔死流）；丢拍由 0.5s 断流看门狗兜底
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+        qb = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                        history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.create_subscription(Twist, '/go2/cmd_vel', self._on_cmd_vel, qb)
         self.create_subscription(String, '/go2/cmd', self._on_cmd, 10)
         self.pub_status = self.create_publisher(String, '/go2/status', 10)
         self.create_timer(1.0, self._pub_status)

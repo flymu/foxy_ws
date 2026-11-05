@@ -1,5 +1,7 @@
 # Go2 校园巡检平台 · 工作站侧（foxy_ws）
 
+开发入口（2026-11-05）：[自主导航恢复计划](DEVELOPMENT_PLAN.md) · [工程 review 与已复现问题](docs/REVIEW_2026-11-05.md)。下文部分历史实验步骤需要按新计划完成部署与回归校验。
+
 Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Livox Mid360 + 工作站（Docker ROS2 Foxy，跑 LIO / 定位 / 规划 / 可视化）。本仓库是**工作站侧**的节点、脚本与配置。
 
 ## 目录速览
@@ -7,8 +9,10 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 | 内容 | 文件 |
 |---|---|
 | 狗控制桥（工作站→cmd_vel→SDK2 RPC） | `go2_bridge.py` `go2_bridge_start.sh`（部署到 Orin）`motion_test.py` |
-| 四足解算位姿桥（固件 /lf/sportmodestate→`/go2/odom`） | `go2_odom_bridge.py`（Orin，rclpy 直订 FastDDS，best_effort）`dog_odom_sim.py`（离线验证器） |
+| 四足解算位姿桥（固件 /lf/sportmodestate→`/go2/odom`，两段接力） | `go2_odom_bridge.py`（Orin，第1段：cyclone 钉 eth1 直订主板）`go2_odom_republish.py`（第2段：默认 FastDDS 栈跨栈透传给工作站）`go2_odom_start.sh`（两段一键启停）`dog_odom_sim.py`（离线验证器） |
 | 巡逻栈一键启停（foxy-live 容器内） | `live_stack_start.sh` `live_stack_stop.sh` `pose_dump.py`（位姿连续性检查） |
+| **独立避障否决层**（最后防线，P0-S） | `obstacle_veto.py`（数据流：`/cmd_vel_raw`→否决→`/go2/cmd_vel`）`veto_calib_probe.py`（安装几何标定）`capture_frames.py`（原始帧采集）`test_veto_offline.py`（离线回放测试，狗不上电可跑）`veto_selfmask_probe.py`（体素掩膜法，已弃用留档）`probe_twist_stream.py` `probe_observer.py`（DDS 流诊断探针，50Hz 流"断流"定责用）
+`peek_status.py`（String 话题旁观器，/veto/status /loc/health 快速回读）`peek_imu.py`（/livox/imu 旁听：频率/模长/与先验法线夹角） |
 | 相机接入（前摄拍照 RPC + RTSP 流桥） | `go2_photo_test.py` `go2_rtsp_test.py` `go2_camera_bridge.py`（Orin）`go2_camera_republish.py`（工作站）`go2_videohub_probe.py` `con_notify_probe.py` `probe_proto.py` `probe2.py` `describe_rtsp.py` |
 | 雷达启停 / 录包 / 建图 | `start_livox.sh` `stop_livox.sh` `record_bag.sh` `point_lio_start.sh` `test_point_lio.sh` `run_combined_test.sh` |
 | LIO / NDT 定位 / 规划（自研 ROS2 包装） | `point_lio_ros2/` `scan_planner_ros2/` `src/livox_ros_driver2`（msg-only 补丁版） |
@@ -31,11 +35,59 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 「最后一致锚点 + 狗航位推算增量」死推，停子图累积（NDT 自然拒绝脏数据）；
 窗口重新一致后无跳变交还 LIO+NDT。狗里程计复位（standup/recovery 重置原点）自动
 识别重建基准，位姿不断裂。健康状态看 `/loc/health`（OK / DEAD_RECKONING）。
-触发过的真实场景：livox 驱动长跑发病喂脏点云，LIO 里程计瞬间漂 28m。
+触发过的真实场景：livox 驱动长跑发病喂脏点云，LIO 里程计瞬间漂 28m（NDT 闸门兜住）；
+2026-10-31 真机实弹——雷达空云（eff=5）把 LIO 喂飞 23m，看门狗反复切入死推（计数至
+第10次），`/loc/pose` 全程钉在原地不动，下游未被带飞（期间 latch/unlatch 震荡，待加解除迟滞）。
+狗里程计通路为两段接力：主板 DDS 只认 CycloneDDS 且钉 eth1（FastDDS 怎么配都收不到），
+该参与者又只在 eth1 多播、工作站发现不了，故由 Orin 上默认 FastDDS 栈的
+`go2_odom_republish.py` 跨栈透传一次，两段一键启停 `go2_odom_start.sh`。
 离线验证：`dog_odom_sim.py` 四场景（mirror 回归 / drift 切换+解除 / glitch 复位
 不误切 / latchtele 死推中复位保持连续），`pose_dump.py` 复查位姿连续性。
+
+## 独立避障否决层 obstacle_veto（撞车事故防线，2026-11-03）
+
+背景：规划器障碍图唯一数据源是实时点云，驱动病时静默冻结、定位游走时障碍图错位，
+且 SportClient.Move 旁路了狗自带 AI 避障——多次撞家具，无独立防线兜底。
+
+本节点是**最后一道闸**：只看原始 `/livox/lidar` + 静态安装几何，独立于
+LIO/定位/规划器。数据流 `scan_planner -r /cmd_vel:=/cmd_vel_raw` → veto → `/go2/cmd_vel`。
+
+- 几何：Mid360 尾部桅杆**前下斜装 47°**（n_up=[-0.733,0.0001,0.680]，h=0.486m，
+  veto_calib_probe.py 从 campus_map 静止段标定）；频带离地 **0.20-0.75m**（下沿
+  0.20：场地坡度+标定残差 ±4cm 会把地板壳漏进 0.05-0.15，净空处也永远拦截——
+  11-03 实弹诊断）；前方 ±60° <1.0m 拦截、侧后 <0.55m 拦截，只消"朝向障碍"的
+  速度分量（保沿墙滑行/脱离），原地转向永不拦（逃生），<0.30m 全消平动。
+- 自体掩膜：传感器正下方小方盒（桅杆座/背的紧簇，行走+静止双验证）；腿/侧腹
+  自遮挡零回波。体素持久性掩膜法会混入起点环境（51%），弃用。
+- 熔断：>1s 无有效云（点数≥2000 且散布≥1m 双判据，防空云假新鲜）→ 全零。
+  节点死 = cmd 流断 = 桥 0.5s 看门狗停车，失效安全。
+- QoS：cmd 链全 BEST_EFFORT depth 1（最新指令赢；RELIABLE 重传在执行器被雷达
+  反序列化拖住时无意义）。**go2_bridge.py 的 /go2/cmd_vel 订阅已同步改 BE，
+  Orin 上的部署副本需 rsync 更新后 veto 才能生效**（BE pub 对 RELIABLE sub
+  QoS 不匹配 = 狗收不到指令）。
+- 输出率：fresh 时 ~15-25Hz（单线程执行器被 640KB 雷达帧反序列化限速），
+  对 0.5s 桥看门狗和 50ms 级拦截延迟无碍；P1 优化改订 PointCloud2 +
+  np.frombuffer 可回 50Hz。
+- 标定（IMU 重力对齐 + 地板锚，2026-11-03）：Mid360 内置 IMU（`/livox/imu`
+  ~181Hz，**g 单位**，静止读数=+g 向上）开机静止窗 ~2s 直接给出法线初值——
+  趴着也给得对，不依赖地板可见性；地板 SVD 精修当"锚"（定 h、定坡道上的
+  真地板方向，校验门 dev<12° 且 h∈0.35-0.68 站立域——坐/趴姿态的错几何会被
+  拒，h=0.309 教训），且**只在 IMU 判准静止时采帧/精修**（"开机=静止"推广成
+  "任何静止时刻"，运动中的帧不采）。锚后 IMU 增量跟踪倾斜（坡道/步态俯仰
+  实时补偿）；倾斜累计>5°（坐/趴/搬动）或静置>120s 自动重修，6 连败后每
+  120s 再给一轮（狗趴了再站起能自愈，无需手动 recalib）。实测：趴着启动
+  IMU 对齐与先验差 1.1°，站起后地板精修 dev=0.4° h=0.472，三源自洽。
+  `ros2 topic pub /veto/cmd std_msgs/String "{data: recalib}"` 手动重标、
+  `"{data: prior}"` 回退先验。状态行 `imu=ok a=0.98 q=1 slope=0.4`：
+  slope=地板法线与重力夹角（≈地面坡度）。
+- 离线测试（狗不上电）：`ros2 bag play campus_map --rate 2.0` + veto 带
+  `-r /go2/cmd_vel:=/veto/cmd_out` + `test_veto_offline.py 125`。
+  健康看 `/veto/status`（state/age_ms/blk/calib/计数）。
 
 ## 注意
 
 - 大文件不入库：bag、地图 PCD、构建产物（见 `.gitignore`）
 - 视频链路 QoS 全 best_effort（reliable 大消息跨 WiFi UDP 会静默卡死订阅方）
+- 主板侧话题（/lf/sportmodestate 等）别信 CLI：`ros2 daemon` 是 FastDDS 参与者，看不见主板
+  （`topic info -v` 显示 publisher count 0 但数据在流）；`topic list` 里"看得见"也可能是自己
+  订阅的自echo——主板侧一律用 python 订阅探活

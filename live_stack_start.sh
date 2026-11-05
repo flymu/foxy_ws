@@ -3,8 +3,11 @@
 # 宿主机用法:
 #   sg docker -c 'docker exec foxy-live bash /home/mu/foxy_ws/live_stack_start.sh'
 # 一键停:    live_stack_stop.sh
-# 前提（Orin 侧，均已开机自启/常驻）:
-#   livox 驱动、go2_bridge.py(控制桥)、go2_odom_bridge.py(四足航位推算桥)
+# 前提（Orin 侧）:
+#   常驻: livox 驱动、go2_bridge.py(控制桥)、go2_odom_bridge.py(四足航位推算桥)
+#   安全栈(2026-11-05 D1+D2 起迁移驻 Orin，起本脚本前要另起):
+#     ssh go2_wifi 'bash /home/unitree/patrol_safety_start.sh [viz]'
+#     (livox_relay 中继 + obstacle_veto 否决层；/livox/lidar 的 WiFi 订阅者只剩 point_lio)
 #   开始实验时把狗唤醒、牵到建图起点附近再起本脚本（known-start 初始化依赖起点）。
 # 相机链路的 republish 若不在跑会顺手补一个（foxy-live 容器重启后需要）。
 MAP=/home/mu/maps/lio_1792684457_global_map.pcd
@@ -14,6 +17,7 @@ mkdir -p $LOG
 pkill -f "[m]ap_localization_node" || true
 pkill -f "[p]oint_lio_node" || true
 pkill -f "[s]can_planner_node" || true
+pkill -f "[o]bstacle_veto" || true   # 只清本机走丢的旧副本（veto 已驻 Orin，勿在本机起）
 pkill -f "[v]iz_helper" || true
 sleep 1
 rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port*
@@ -27,7 +31,10 @@ nohup /home/mu/foxy_ws/install_x86/point_lio_ros2/lib/point_lio_ros2/point_lio_n
 nohup /home/mu/foxy_ws/install_x86/point_lio_ros2/lib/point_lio_ros2/map_localization_node \
     --ros-args -p map_file:=$MAP > $LOG/loc.log 2>&1 &
 nohup /home/mu/foxy_ws/install_x86/scan_planner_ros2/lib/scan_planner_ros2/scan_planner_node \
-    --ros-args -r /cmd_vel:=/go2/cmd_vel -p max_vx:=0.4 > $LOG/planner.log 2>&1 &
+    --ros-args -r /cmd_vel:=/cmd_vel_raw -p max_vx:=0.4 > $LOG/planner.log 2>&1 &
+# P0-S 独立避障否决层已驻 Orin（D1+D2，2026-11-05）：/cmd_vel_raw 经 WiFi 小报文
+# → Orin veto → /go2/cmd_vel 本地给桥。本机不再起 veto（也不再订雷达 WiFi 大流）。
+#   起法: ssh go2_wifi 'bash /home/unitree/patrol_safety_start.sh [viz]'
 nohup python3 /home/mu/foxy_ws/viz_helper.py > $LOG/viz.log 2>&1 &
 if ! pgrep -f "[g]o2_camera_republish" > /dev/null; then
     nohup python3 /home/mu/foxy_ws/go2_camera_republish.py > $LOG/camera.log 2>&1 &
@@ -35,6 +42,7 @@ fi
 
 sleep 2
 echo "存活节点数: $(ps aux | grep -cE '[p]oint_lio_node|[m]ap_localization_node|[s]can_planner_node|[v]iz_helper')/4"
+echo "veto 健康(驻Orin,跨DDS可见): timeout -s INT 4 ros2 topic echo /veto/status --once"
 echo "=== live stack up, logs in $LOG ==="
 echo "健康状态: timeout -s INT 8 ros2 topic echo /loc/health"
 echo "（狗唤醒后 Orin go2_odom_bridge 才有 /go2/odom 数据，看门狗随之激活）"

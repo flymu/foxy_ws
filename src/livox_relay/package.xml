@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://relaxng.org"?>
+<package format="3">
+  <name>livox_relay</name>
+  <version>0.1.0</version>
+  <description>CustomMsg→PointCloud2 本地中继（D2 修复：绕开 rclpy 对 CustomMsg 的 ctypes 逐点反序列化天花板）</description>
+  <maintainer email="mu@example.com">mu</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>livox_ros_driver2</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
