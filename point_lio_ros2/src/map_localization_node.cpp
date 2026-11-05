@@ -20,10 +20,34 @@
 //   交还 LIO+NDT。无 /go2/odom 数据时看门狗整体停用，行为与旧版一致。
 //   线程约定：回调均在默认单线程执行器，狗/LIO 缓冲只需执行器内自洽；
 //   T_mo_ 仍由 t_mo_mutex_ 保护（NDT 后台线程写）。
+//
+// R5/G4 修复批（2026-11-05，评审 R5 + P0-1/2/3）：
+//   * 冻结回跳修复：死推期狗流断供的保活位姿=最后发布的死推位姿（旧版回到
+//     初始锚点，狗在死推期间移动时会跳回，评审 R5 实锤）。
+//   * 解除迟滞（P0-3）：解除需连续 dog_unlatch_checks 窗一致且跨度 ≥
+//     dog_unlatch_span 秒（旧版 10 窗≈1s，latch/unlatch 震荡）；狗流断供 >0.5s
+//     恢复时清空差分缓冲重建基准（治 10-31 断供后相邻窗口错判）。
+//   * 三态健康（P0-2）：/loc/health 改 1Hz 墙钟心跳（旧版只在 on_odom 里发，
+//     odom 停了健康也停），格式 "STATE|reason|age_s"：
+//       INITIALIZING = 未初始化/续接判决未决；OK = LIO+NDT 可用；
+//       STALE = odom 流断供（位姿冻结）；DEGRADED = 看门狗死推中（狗流驱动）;
+//       LOST = 死推中且狗流也断供（位姿冻结，不可用）。
+//     OK 且 use_dog_odom 但从未收到狗流 → reason=no_dog_watchdog（可见性）。
+//   * 持久化续接（P0-1）：每 5s 落盘 (T_mo, 狗位姿)；下次启动狗位姿与落盘值
+//     平移 <0.5m 且偏航 <0.3rad（狗里程计系未重置）→ 续接 T_mo，跳过 known-start。
+//     狗动过/换系/超龄 → 回退 known-start。
+//   * /initialpose 重定位注入（BBS/人工兜底）：PoseWithCovarianceStamped 按
+//     T_mb(map←body) 语义生效——x/y/yaw 取消息值，z/roll/pitch 沿用当前，
+//     T_mo = T_mb·T_ob⁻¹，子图在 odom 系无需清，NDT 以新 T_mo 为猜测自然精修。
+//     看门狗锁存中收到 → 仅记录不生效（死推位姿不受影响，解除时按死推接管）。
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,6 +57,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <builtin_interfaces/msg/time.hpp>
@@ -73,8 +98,16 @@ public:
         dog_bad_abs_ = declare_parameter<double>("dog_bad_abs", 0.5);        // 位移分歧绝对阈值(m)
         dog_bad_rel_k_ = declare_parameter<double>("dog_bad_rel_k", 0.25);   // 随狗位移加宽
         dog_bad_yaw_ = declare_parameter<double>("dog_bad_yaw", 0.8);         // 偏航分歧阈值(rad)
-        dog_jump_speed_ = declare_parameter<double>("dog_jump_speed", 1.5);  // 狗流复位检测(m/s)
-        dog_unlatch_checks_ = declare_parameter<int>("dog_unlatch_checks", 10);
+        // 狗流复位检测(m/s)：真实复位=瞬移量级(米/0.1s)；Go2 正常极速≈2m/s，
+        // 4.0=2 倍余量。旧值 1.5 会在快走/推车段误报（实测袋回放 1.53m/s 帧对）。
+        dog_jump_speed_ = declare_parameter<double>("dog_jump_speed", 4.0);
+        dog_unlatch_checks_ = declare_parameter<int>("dog_unlatch_checks", 30); // P0-3: 10→30 窗
+        dog_unlatch_span_ = declare_parameter<double>("dog_unlatch_span", 3.0); // P0-3: 一致窗还需 ≥3s
+        persist_path_ = declare_parameter<std::string>("persist_path", "/home/mu/maps/loc_state.txt");
+        persist_max_age_h_ = declare_parameter<double>("persist_max_age_h", 12.0);
+        resume_dog_tol_ = declare_parameter<double>("resume_dog_tol", 0.5);   // 续接位移容差(m)
+        resume_dog_yaw_ = declare_parameter<double>("resume_dog_yaw", 0.3);   // 续接偏航容差(rad)
+        resume_grace_ = declare_parameter<double>("resume_grace", 1.5);       // 续接判决宽限(s)
 
         if (map_file_.empty())
         {
@@ -116,15 +149,25 @@ public:
             sub_dog_ = create_subscription<nav_msgs::msg::Odometry>(
                 "/go2/odom", dq,
                 [this](nav_msgs::msg::Odometry::ConstSharedPtr m) { on_dog(std::move(m)); });
-            pub_health_ = create_publisher<std_msgs::msg::String>("/loc/health", 10);
         }
+        pub_health_ = create_publisher<std_msgs::msg::String>("/loc/health", 10);
+        sub_initialpose_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+            "/initialpose", rclcpp::QoS(10),
+            [this](geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr m) {
+                on_initialpose(std::move(m));
+            });
         pub_loc_ = create_publisher<nav_msgs::msg::Odometry>("/loc/pose", 10);
         tfb_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
-
+        start_wall_ = now();
+        last_odom_wall_ = start_wall_;
+        health_timer_ = create_wall_timer(1s, [this]() { on_health_timer(); }); // R5: 健康独立心跳
+        persist_timer_ = create_wall_timer(5s, [this]() { save_persist(); });  // P0-1: 持久化
+        load_persist();                                                          // P0-1: 续接判决
         RCLCPP_INFO(get_logger(),
-                    "map_localization 就绪: init=(%.2f, %.2f, %.0f deg) submap=%d 帧 | 狗航位推算看门狗%s",
+                    "map_localization 就绪: init=(%.2f, %.2f, %.0f deg) submap=%d 帧 | 狗航位推算看门狗%s%s",
                     init_x_, init_y_, init_yaw_deg_, submap_frames_,
-                    use_dog_odom_ ? "开(等 /go2/odom)" : "关");
+                    use_dog_odom_ ? "开(等 /go2/odom)" : "关",
+                    resume_candidate_ ? " | 有续接候选(等狗流验证)" : "");
     }
 
     ~MapLocalizationNode() override
@@ -136,9 +179,12 @@ public:
 private:
     struct StampedPose
     {
-        double t;
+        double t;    // 流内时间戳（狗钟/livox 钟不同源，只在流内使用）
+        double wall; // 接收墙钟秒（跨流对齐专用——狗 stamp 不能索引 LIO 缓冲）
         Eigen::Affine3d T;
-        StampedPose(double t_, const Eigen::Affine3d &T_) : t(t_), T(T_) {}
+        StampedPose(double t_, const Eigen::Affine3d &T_) : t(t_), wall(0.0), T(T_) {}
+        StampedPose(double t_, double wall_, const Eigen::Affine3d &T_)
+            : t(t_), wall(wall_), T(T_) {}
     };
     enum class Verdict { NO_INFO, GOOD, BAD };
 
@@ -170,17 +216,17 @@ private:
         return a;
     }
 
-    static void pushPose(std::deque<StampedPose> &buf, double t,
+    static void pushPose(std::deque<StampedPose> &buf, double t, double wall,
                          const Eigen::Affine3d &T, double keep)
     {
-        buf.emplace_back(t, T);
+        buf.emplace_back(t, wall, T);
         while (!buf.empty() && buf.front().t < t - keep)
             buf.pop_front();
     }
 
     // 最近 win 秒的内部差分（用各自流自身时间戳，跨度不足不判）
     static bool windowDelta(const std::deque<StampedPose> &buf, double win,
-                            double &dpos, double &dyaw)
+                            double &dpos, double &dyaw, double *wall0_out = nullptr)
     {
         if (buf.size() < 2)
             return false;
@@ -196,10 +242,57 @@ private:
             }
         if (newest.t - old->t < 0.5 * win)
             return false;
+        if (wall0_out)
+            *wall0_out = old->wall;
         Eigen::Vector3d dp = newest.T.translation() - old->T.translation();
         dpos = std::hypot(dp.x(), dp.y());
         dyaw = wrapAngle(yawOf(newest.T) - yawOf(old->T));
         return true;
+    }
+
+    // buf 在墙钟 [wall0, newest] 间隔上的内部差分——与狗窗口等长比较用。
+    // 跨流匹配必须走墙钟：狗 stamp 与 livox stamp 不同源，域不可比。
+    static bool intervalDelta(const std::deque<StampedPose> &buf, double wall0,
+                              double &dpos, double &dyaw)
+    {
+        if (buf.size() < 2)
+            return false;
+        const StampedPose &newest = buf.back();
+        const StampedPose *old = nullptr;
+        for (const auto &s : buf)
+            if (s.wall >= wall0 - 0.05)
+            {
+                old = &s;
+                break;
+            }
+        // LIO 在该间隔覆盖不足（起点晚出 >0.2s）→ 不裁决，防止又一次窗口错配
+        if (!old || old == &newest || old->wall - wall0 > 0.2)
+            return false;
+        Eigen::Vector3d dp = newest.T.translation() - old->T.translation();
+        dpos = std::hypot(dp.x(), dp.y());
+        dyaw = wrapAngle(yawOf(newest.T) - yawOf(old->T));
+        return true;
+    }
+
+    // LIO 在狗跳变对所在的墙钟间隔内是否发生了 ≥50% 的可比位移——
+    // 狗/LIO 同跳 = 真实运动或 LIO 自身修正，不是狗复位
+    static bool lioMovedLikewise(const std::deque<StampedPose> &buf,
+                                 double wall0, double wall1, double dp)
+    {
+        if (buf.size() < 2 || dp <= 0)
+            return false;
+        const StampedPose *a = nullptr, *b = nullptr;
+        for (const auto &s : buf)
+        {
+            if (!a && s.wall >= wall0 - 0.05)
+                a = &s;
+            if (s.wall <= wall1 + 0.05)
+                b = &s;
+        }
+        if (!a || !b || b->wall <= a->wall)
+            return false;
+        double dl = (b->T.translation() - a->T.translation()).head<2>().norm();
+        return dl >= 0.5 * dp;
     }
 
     // ---- 狗四足航位推算回调（dog_odom 系全位姿，只用相对差分）----
@@ -207,16 +300,32 @@ private:
     {
         if (!use_dog_odom_)
             return;
+        // P0-3: 断供 >0.5s 后恢复 → 清差分缓冲重建基准（治 10-31 断供后
+        // 相邻窗口拿断供前后样本错判 latch；狗系没换，锚点仍有效）
+        if (have_dog_ && (now() - last_dog_wall_).seconds() > 0.5)
+        {
+            dog_buf_.clear();
+            RCLCPP_WARN(get_logger(), "[watchdog] 狗流断供 %.1fs 后恢复，重建差分基准",
+                        (now() - last_dog_wall_).seconds());
+        }
+        // P0-1: 续接判决——狗流首帧（或恢复帧）与落盘狗位姿比对
+        if (resume_candidate_ && !resume_attempted_ && have_init_)
+            try_resume(odom2affine(*m));
         double t = stamp2sec(m->header.stamp);
         if (t <= 0.0)
             return;
         Eigen::Affine3d T = odom2affine(*m);
         // 复位/野值检测：瞬移速度超限（standup/recovery 会重置狗里程计原点）
+        // 11-06 修复: (1)阈值 1.5→4.0 m/s——真人快走推杆架就有 1.53m/s 的帧对，
+        // 1.5 会在快走段天天误报复位; (2)LIO 同跳排除——狗/LIO 同跳=真实运动或
+        // LIO 修正，只有"狗独跳"才配叫复位。
         if (!dog_buf_.empty() && t > dog_buf_.back().t)
         {
             double dt = t - dog_buf_.back().t;
             double dp = (T.translation() - dog_buf_.back().T.translation()).head<2>().norm();
-            if (dp / dt > dog_jump_speed_)
+            double wall_now = now().seconds();
+            if (dp / dt > dog_jump_speed_ &&
+                !lioMovedLikewise(lio_buf_, dog_buf_.back().wall, wall_now, dp))
             {
                 dog_resets_++;
                 if (lio_bad_)
@@ -232,7 +341,7 @@ private:
                             dp, dt * 1e3, dog_resets_);
             }
         }
-        pushPose(dog_buf_, t, T, 2.0 * dog_window_);
+        pushPose(dog_buf_, t, now().seconds(), T, 2.0 * dog_window_);
         have_dog_ = true;
         last_dog_wall_ = now();
         last_dog_msg_ = *m;
@@ -251,8 +360,14 @@ private:
             return Verdict::NO_INFO;
         }
         double lio_d = 0, lio_dyaw = 0, dog_d = 0, dog_dyaw = 0;
-        if (!windowDelta(lio_buf_, dog_window_, lio_d, lio_dyaw) ||
-            !windowDelta(dog_buf_, dog_window_, dog_d, dog_dyaw))
+        double dog_wall0 = 0;
+        // 狗窗口先行（重建后如实缩短，≥0.5×win 才裁决）；LIO 必须在狗窗口的
+        // 同一墙钟间隔上取位移。11-06 复盘: 基准重建后狗窗 1.2s vs LIO 窗 2.0s，
+        // 快走 0.8m/s 时窗口长度差本身就能顶爆 |Δ|≥0.5 阈值 → mirror 全程一致
+        // 却在快走段被假锁"位移分歧"3.2s。等长比较后窗口差不再参与判决。
+        if (!windowDelta(dog_buf_, dog_window_, dog_d, dog_dyaw, &dog_wall0))
+            return Verdict::NO_INFO;
+        if (!intervalDelta(lio_buf_, dog_wall0, lio_d, lio_dyaw))
             return Verdict::NO_INFO;
 
         bool bad = false;
@@ -280,8 +395,16 @@ private:
                 latch(why, lio_d, dog_d);
             return Verdict::BAD;
         }
-        if (lio_bad_ && ++healthy_cnt_ >= dog_unlatch_checks_)
-            unlatch();
+        if (lio_bad_)
+        {
+            // P0-3 解除迟滞：窗口数与时间跨度双条件（旧版 10 窗≈1s，会震荡）
+            if (healthy_cnt_ == 0)
+                healthy_since_wall_ = now();
+            ++healthy_cnt_;
+            if (healthy_cnt_ >= dog_unlatch_checks_ &&
+                (now() - healthy_since_wall_).seconds() >= dog_unlatch_span_)
+                unlatch();
+        }
         return Verdict::GOOD;
     }
 
@@ -289,6 +412,8 @@ private:
     {
         lio_bad_ = true;
         latches_++;
+        have_dr_last_ = false; // 新一轮死推，冻结保活基准作废
+        latched_wall_ = now();
         if (agree_valid_)
         {
             // 用"最后一致"锚点：裁决晚于发病，锚点最多回退一个窗口
@@ -304,7 +429,7 @@ private:
         RCLCPP_ERROR(get_logger(),
                      "[watchdog] %s: LIO Δ%.2fm vs 狗 Δ%.2fm → 位姿切四足死推(第%d次)",
                      why, lio_d, dog_d, latches_);
-        set_health("DEAD_RECKONING");
+        publish_health_now();
     }
 
     void unlatch()
@@ -318,17 +443,24 @@ private:
         }
         lio_bad_ = false;
         healthy_cnt_ = 0;
+        have_dr_last_ = false;
         agree_valid_ = false; // 窗口重新积累后再刷锚点
         RCLCPP_WARN(get_logger(),
                     "[watchdog] 分歧解除 → 回归 LIO+NDT（T_mo 按死推位姿续接，无跳变）");
-        set_health("OK");
+        publish_health_now();
     }
 
-    // 死推位姿输出: T_mb = T_mb_anchor * inv(T_dog_anchor) * T_dog_now；frozen 则锚点冻结
+    // 死推位姿输出: T_mb = T_mb_anchor * inv(T_dog_anchor) * T_dog_now；
+    // 冻结保活 = 最后发布的死推位姿（R5 修复：旧版回跳初始锚点）
     void publishDR(const StampedPose &dog_now, bool frozen, const rclcpp::Time &stamp)
     {
-        Eigen::Affine3d T_mb = frozen ? T_mb_anchor_
+        Eigen::Affine3d T_mb = frozen ? (have_dr_last_ ? T_mb_dr_last_ : T_mb_anchor_)
                                        : T_mb_anchor_ * dog_anchor_.T.inverse() * dog_now.T;
+        if (!frozen)
+        {
+            T_mb_dr_last_ = T_mb; // 冻结保活的"最后有效输出"
+            have_dr_last_ = true;
+        }
         nav_msgs::msg::Odometry out;
         out.header.stamp = stamp;
         out.header.frame_id = map_frame_;
@@ -394,15 +526,17 @@ private:
                 T_mo_init_ = T_mo_;
             }
             have_init_ = true;
+            resume_deadline_wall_ = now(); // 续接判决宽限从初始化起算
             RCLCPP_INFO(get_logger(), "[init] T_map_odom 初始化完成");
         }
 
         last_odom_ = *m;
         have_odom_ = true;
+        last_odom_wall_ = now();
 
         Eigen::Affine3d T_ob = odom2affine(*m);
         double t = stamp2sec(m->header.stamp);
-        pushPose(lio_buf_, t, T_ob, 2.0 * dog_window_); // 看门狗的 LIO 差分缓冲
+        pushPose(lio_buf_, t, last_odom_wall_.seconds(), T_ob, 2.0 * dog_window_); // 看门狗的 LIO 差分缓冲
 
         // 看门狗裁决（仅在有狗流时生效；无狗数据时行为与旧版一致）
         Verdict v = Verdict::NO_INFO;
@@ -483,14 +617,7 @@ private:
             if (dog_age > 0.5)
                 publishDR(dog_anchor_, true, m->header.stamp);
         }
-
-        // 健康状态低频心跳（状态切换时 set_health 已即时发布）
-        if (use_dog_odom_ && ++health_cnt_ % 100 == 0)
-        {
-            std_msgs::msg::String h;
-            h.data = health_;
-            pub_health_->publish(h);
-        }
+        // R5: 健康心跳移交 1Hz 墙钟定时器（odom 停了健康也得继续说话）
     }
 
     void on_cloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr m)
@@ -557,7 +684,7 @@ private:
         // 失配判据: 未收敛 / fitness 超限 / 相对猜测跳变超限
         double jump = (T_new.translation() - Eigen::Affine3d(guess).translation()).norm();
         bool ok = ndt_.hasConverged() && fitness < fitness_limit_ && jump < jump_limit_;
-        Eigen::Affine3d T_mo_after;
+        Eigen::Affine3d T_mo_after, T_mo_init_snap;
         {
             std::lock_guard<std::mutex> lk(t_mo_mutex_);
             if (ok)
@@ -566,10 +693,11 @@ private:
                 good_matches_++;
             }
             T_mo_after = T_mo_;
+            T_mo_init_snap = T_mo_init_; // resume/reseed 会在执行器里改它，读取同锁
         }
         if (matches_ % 50 == 0)
         {
-            Eigen::Affine3d d = T_mo_after * T_mo_init_.inverse();
+            Eigen::Affine3d d = T_mo_after * T_mo_init_snap.inverse();
             RCLCPP_INFO(get_logger(),
                         "[match] %d/%d ok | fitness=%.3f jump=%.3f | T_mo 漂移=(%.2f,%.2f,%.2f)m",
                         good_matches_, matches_, fitness, jump, d.translation().x(),
@@ -577,14 +705,230 @@ private:
         }
     }
 
-    void set_health(const std::string &s)
+    // ---- R5/P0-2: 健康状态 ----
+    // 格式 "STATE|reason|age_s"。规划器取 '|' 前缀判准入，人读全文。
+    std::string compute_health() const
     {
-        health_ = s;
-        if (!pub_health_)
-            return;
+        char buf[96];
+        double since_start = (now() - start_wall_).seconds();
+        if (!have_init_)
+        {
+            std::snprintf(buf, sizeof buf, "INITIALIZING|waiting_odom|%.1f", since_start);
+            return buf;
+        }
+        if (resume_candidate_ && !resume_attempted_ &&
+            (now() - resume_deadline_wall_).seconds() <= resume_grace_)
+        {
+            std::snprintf(buf, sizeof buf, "INITIALIZING|resume_pending|%.1f", since_start);
+            return buf;
+        }
+        double odom_age = (now() - last_odom_wall_).seconds();
+        if (lio_bad_)
+        {
+            double dog_age = have_dog_ ? (now() - last_dog_wall_).seconds() : 1e9;
+            if (!have_dog_ || dog_age > 2.0)
+            {
+                std::snprintf(buf, sizeof buf, "LOST|dead_reckon_dog_gap|%.1f", dog_age);
+                return buf;
+            }
+            std::snprintf(buf, sizeof buf, "DEGRADED|dead_reckoning|%.1f",
+                          (now() - latched_wall_).seconds());
+            return buf;
+        }
+        if (odom_age > 2.0)
+        {
+            std::snprintf(buf, sizeof buf, "STALE|odom_gap|%.1f", odom_age);
+            return buf;
+        }
+        if (use_dog_odom_ && !have_dog_)
+        {
+            std::snprintf(buf, sizeof buf, "OK|no_dog_watchdog|%.1f", odom_age);
+            return buf;
+        }
+        std::snprintf(buf, sizeof buf, "OK|lio_ndt|%.1f", odom_age);
+        return buf;
+    }
+
+    void publish_health_now()
+    {
         std_msgs::msg::String h;
-        h.data = s;
-        pub_health_->publish(h);
+        h.data = compute_health();
+        pub_health_->publish(h); // pub_health_ 构造即建（不再依赖 use_dog_odom_）
+    }
+
+    void on_health_timer()
+    {
+        publish_health_now(); // 1Hz 心跳：与数据流解耦，odom 停也照说 STALE/LOST
+    }
+
+    // ---- P0-1: 续接判决（狗流首帧 vs 落盘狗位姿）----
+    void try_resume(const Eigen::Affine3d &dog_now)
+    {
+        resume_attempted_ = true;
+        double dp = (dog_now.translation() - saved_dog_pose_.translation()).head<2>().norm();
+        double dy = std::fabs(wrapAngle(yawOf(dog_now) - yawOf(saved_dog_pose_)));
+        if (dp < resume_dog_tol_ && dy < resume_dog_yaw_)
+        {
+            std::lock_guard<std::mutex> lk(t_mo_mutex_);
+            T_mo_ = saved_T_mo_;
+            T_mo_init_ = saved_T_mo_;
+            agree_valid_ = false;
+            RCLCPP_INFO(get_logger(),
+                        "[resume] 狗位姿与上次会话差 %.2fm/%.1f° → 续接 T_mo（跳过 known-start）",
+                        dp, dy * 180.0 / M_PI);
+        }
+        else
+        {
+            RCLCPP_WARN(get_logger(),
+                        "[resume] 狗已移动 %.2fm/%.1f°（或狗里程计已重置）→ 维持 known-start",
+                        dp, dy * 180.0 / M_PI);
+        }
+        publish_health_now();
+    }
+
+    // ---- P0-1: 持久化 ----
+    void save_persist()
+    {
+        if (!have_init_ || lio_bad_)
+            return; // 只落盘健康态 T_mo；死推期 T_mo 不可信，保留上一份好值
+        Eigen::Matrix4d Tm;
+        {
+            std::lock_guard<std::mutex> lk(t_mo_mutex_);
+            Tm = T_mo_.matrix();
+        }
+        std::string tmp = persist_path_ + ".tmp";
+        {
+            std::ofstream f(tmp);
+            if (!f)
+                return;
+            f << "# loc_persist v1\n";
+            f << "map_file " << map_file_ << "\n";
+            f << "wall " << std::time(nullptr) << "\n";
+            f << "t_mo";
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 4; ++c)
+                    f << " " << Tm(r, c);
+            f << "\n";
+            if (have_dog_)
+            {
+                Eigen::Affine3d D = odom2affine(last_dog_msg_);
+                Eigen::Quaterniond q(D.rotation());
+                f << "dog " << D.translation().x() << " " << D.translation().y() << " "
+                  << D.translation().z() << " " << q.x() << " " << q.y() << " " << q.z()
+                  << " " << q.w() << "\n";
+            }
+            else
+                f << "dog none\n";
+        }
+        std::rename(tmp.c_str(), persist_path_.c_str());
+    }
+
+    void load_persist()
+    {
+        std::ifstream f(persist_path_);
+        if (!f)
+            return; // 没有落盘文件：全新会话，known-start 语义不变
+        std::string tag, saved_map, first;
+        double wall = 0;
+        Eigen::Affine3d Tm = Eigen::Affine3d::Identity();
+        Eigen::Affine3d dog = Eigen::Affine3d::Identity();
+        bool have_tmo = false, have_dog_pose = false;
+        while (f >> tag)
+        {
+            if (tag == "map_file")
+                f >> saved_map;
+            else if (tag == "wall")
+                f >> wall;
+            else if (tag == "t_mo")
+            {
+                Eigen::Matrix4d m = Eigen::Matrix4d::Identity();
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        f >> m(r, c);
+                if (!f.fail())
+                {
+                    Tm = Eigen::Affine3d(m);
+                    have_tmo = true;
+                }
+            }
+            else if (tag == "dog")
+            {
+                f >> first;
+                if (first == "none")
+                    continue;
+                std::array<double, 7> v;
+                v[0] = std::stod(first);
+                for (int i = 1; i < 7; ++i)
+                    f >> v[i];
+                Eigen::Quaterniond q(v[6], v[3], v[4], v[5]); // w x y z
+                if (q.norm() < 0.5)
+                    continue;
+                dog = Eigen::Affine3d::Identity();
+                dog.translation() = Eigen::Vector3d(v[0], v[1], v[2]);
+                dog.linear() = q.normalized().toRotationMatrix();
+                have_dog_pose = true;
+            }
+        }
+        double age_h = (std::time(nullptr) - wall) / 3600.0;
+        if (have_tmo && have_dog_pose && saved_map == map_file_ && age_h < persist_max_age_h_)
+        {
+            resume_candidate_ = true;
+            saved_T_mo_ = Tm;
+            saved_dog_pose_ = dog;
+            RCLCPP_INFO(get_logger(),
+                        "[resume] 落盘 %.1fh 前：有续接候选，等狗流验证（%.2fm/%.1f° 内才续接）",
+                        age_h, resume_dog_tol_, resume_dog_yaw_ * 180.0 / M_PI);
+        }
+        else
+        {
+            RCLCPP_INFO(get_logger(),
+                        "[resume] 落盘不符（地图%s 龄%.1fh 狗位姿%s）→ 走 known-start",
+                        saved_map == map_file_ ? "匹配" : "不匹配", age_h,
+                        have_dog_pose ? "有" : "无");
+        }
+    }
+
+    // ---- D: /initialpose 重定位注入（BBS 种子 / RViz 2D Pose Estimate 人工兜底）----
+    void on_initialpose(geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr m)
+    {
+        if (!have_init_ || !have_odom_)
+        {
+            RCLCPP_WARN(get_logger(), "[reseed] 初始化前收到 /initialpose，忽略");
+            return;
+        }
+        if (lio_bad_)
+        {
+            RCLCPP_WARN(get_logger(),
+                        "[reseed] 看门狗死推中，/initialpose 不生效（死推位姿正确，解除时按死推接管）");
+            return;
+        }
+        const auto &p = m->pose.pose.position;
+        const auto &q = m->pose.pose.orientation;
+        Eigen::Affine3d T_ob = odom2affine(last_odom_);
+        Eigen::Affine3d T_mb_prev = Eigen::Affine3d::Identity();
+        {
+            std::lock_guard<std::mutex> lk(t_mo_mutex_);
+            T_mb_prev = T_mo_ * T_ob;
+        }
+        Eigen::Matrix3d Rmsg = Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
+        double yaw_new = std::atan2(Rmsg(1, 0), Rmsg(0, 0));
+        double yaw_prev = yawOf(T_mb_prev);
+        Eigen::Affine3d T_mb_new = T_mb_prev;
+        T_mb_new.translation().x() = p.x;
+        T_mb_new.translation().y() = p.y;
+        T_mb_new.linear() = Eigen::AngleAxisd(wrapAngle(yaw_new - yaw_prev),
+                                              Eigen::Vector3d::UnitZ()) *
+                             T_mb_prev.rotation(); // 只改 yaw，z/roll/pitch 沿用
+        {
+            std::lock_guard<std::mutex> lk(t_mo_mutex_);
+            T_mo_ = T_mb_new * T_ob.inverse();
+            T_mo_init_ = T_mo_;
+        }
+        agree_valid_ = false; // 锚点作废，窗口重新积累
+        RCLCPP_WARN(get_logger(),
+                    "[reseed] T_mo ← /initialpose T_mb=(%.2f, %.2f, yaw %.1f°)，NDT 由此精修",
+                    p.x, p.y, yaw_new * 180.0 / M_PI);
+        publish_health_now();
     }
 
     static Eigen::Affine3d odom2affine(const nav_msgs::msg::Odometry &m)
@@ -607,17 +951,30 @@ private:
     bool use_dog_odom_ = true, have_dog_ = false;
     double dog_window_ = 2.0, dog_bad_abs_ = 0.5, dog_bad_rel_k_ = 0.25;
     double dog_bad_yaw_ = 0.8, dog_jump_speed_ = 1.5;
-    int dog_unlatch_checks_ = 10, healthy_cnt_ = 0, latches_ = 0, dog_resets_ = 0;
+    double dog_unlatch_span_ = 3.0;
+    int dog_unlatch_checks_ = 30, healthy_cnt_ = 0, latches_ = 0, dog_resets_ = 0;
     std::deque<StampedPose> lio_buf_, dog_buf_;
     rclcpp::Time last_dog_wall_{0, 0, RCL_ROS_TIME};
     bool lio_bad_ = false, agree_valid_ = false;
     Eigen::Affine3d T_mb_agree_{Eigen::Affine3d::Identity()};
     Eigen::Affine3d T_mb_anchor_{Eigen::Affine3d::Identity()};
+    Eigen::Affine3d T_mb_dr_last_{Eigen::Affine3d::Identity()};
+    bool have_dr_last_ = false; // R5: 死推期"最后发布的位姿"（冻结保活基准）
     StampedPose dog_agree_{0.0, Eigen::Affine3d::Identity()};
     StampedPose dog_anchor_{0.0, Eigen::Affine3d::Identity()};
     nav_msgs::msg::Odometry last_dog_msg_;
-    std::string health_ = "OK";
-    int health_cnt_ = 0;
+    rclcpp::Time start_wall_{0, 0, RCL_ROS_TIME}, last_odom_wall_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time latched_wall_{0, 0, RCL_ROS_TIME}, healthy_since_wall_{0, 0, RCL_ROS_TIME};
+
+    // ---- P0-1 持久化续接 ----
+    std::string persist_path_;
+    double persist_max_age_h_ = 12.0, resume_dog_tol_ = 0.5, resume_dog_yaw_ = 0.3, resume_grace_ = 1.5;
+    bool resume_candidate_ = false, resume_attempted_ = false;
+    Eigen::Affine3d saved_T_mo_{Eigen::Affine3d::Identity()};
+    Eigen::Affine3d saved_dog_pose_{Eigen::Affine3d::Identity()};
+    rclcpp::Time resume_deadline_wall_{0, 0, RCL_ROS_TIME};
+    rclcpp::TimerBase::SharedPtr health_timer_, persist_timer_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_initialpose_;
 
     // ---- 状态 ----
     pcl::PointCloud<pcl::PointXYZI>::Ptr map_ds_{new pcl::PointCloud<pcl::PointXYZI>};

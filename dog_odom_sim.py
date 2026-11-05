@@ -9,6 +9,9 @@ dog_odom_sim.py — 狗航位推算看门狗的离线验证器（foxy 容器内�
   drift  [N] 狗=LIO+0.5m/s 漂移，N 秒后偏移冻结 → 应 2-4s 切死推、N 秒后解除
   glitch     mirror，第 15s 瞬移 +5m → 应识别"狗里程计复位"，不误切死推
   latchtele  漂移 10s（先切死推）→ 瞬移 +5m（死推中复位）→ 偏移冻结（解除）
+  latedrift [start=100] [dur=8]  先 mirror，start 秒后开始漂移 dur 秒再冻结
+             → 用于"狗已走远后才锁死推"场景：冻结回跳修复必须在这种
+               情况下验证（漂移起点=anchor 离当前位姿很远）
 """
 import sys
 import time
@@ -20,6 +23,7 @@ from nav_msgs.msg import Odometry
 
 SCEN = sys.argv[1] if len(sys.argv) > 1 else "mirror"
 SWITCH = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
+DUR = float(sys.argv[3]) if len(sys.argv) > 3 else 8.0
 DRIFT_RATE = 0.5  # m/s
 
 rclpy.init()
@@ -42,6 +46,12 @@ def dog_offset(el):
         return DRIFT_RATE * 10.0 + 5.0 if el >= 10.0 else DRIFT_RATE * el
     if SCEN == "drift":
         return DRIFT_RATE * el if el < SWITCH else DRIFT_RATE * SWITCH
+    if SCEN == "latedrift":
+        if el < SWITCH:
+            return 0.0
+        if el < SWITCH + DUR:
+            return DRIFT_RATE * (el - SWITCH)
+        return DRIFT_RATE * DUR
     raise SystemExit("未知场景: " + SCEN)
 
 
