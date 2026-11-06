@@ -68,3 +68,6 @@ mapping:
       # 不配 save：Point-LIO ROS2 版没有 /map_save 服务，退出时自动把地图写到
       # map_save_path（见 stacks.yaml），"停止建图"即存图，网页不需要保存按钮。
   # runs_dir 默认 ${data_root}/runs：每条轨迹的 est.tum / run.json 落在这里
+  # exports_dir 默认 ${data_root}/exports：网页「导出地图」的 npz + PCD 存档，
+  # 「历史地图」里可一键载回控制台内存（控制台重启/狗断电后现场不丢）。
+  exports_dir: ${data_root}/exports

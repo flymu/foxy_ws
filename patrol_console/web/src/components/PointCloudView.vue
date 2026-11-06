@@ -15,6 +15,7 @@ const props = defineProps<{
   layers: Record<LayerKey, boolean>
   mode: ViewMode
   pointSize: number // 点大小倍数，1 = 和体素一样大
+  sliceRange: [number, number] | null // 高度切片：只显示 z 在此范围内的点，null = 关
 }>()
 
 const host = ref<HTMLDivElement | null>(null)
@@ -29,7 +30,11 @@ uniform float uZMin;
 uniform float uZMax;
 uniform vec3 uColor;
 uniform float uSolid;  // 1 = 统一颜色（当前帧），0 = 按高度着色（地图）
+uniform float uClipOn; // 1 = 高度切片开：z 不在 [uClipMin, uClipMax] 里的点丢弃
+uniform float uClipMin;
+uniform float uClipMax;
 varying vec3 vColor;
+varying float vClip;
 
 vec3 ramp(float t) {
   vec3 a = vec3(0.60, 0.86, 0.93);  // 低处：淡青
@@ -48,11 +53,14 @@ void main() {
   gl_PointSize = clamp(px, 1.5, 18.0);
   float t = clamp((position.z - uZMin) / max(uZMax - uZMin, 0.1), 0.0, 1.0);
   vColor = uSolid > 0.5 ? uColor : ramp(t);
+  vClip = uClipOn < 0.5 ? 1.0 : step(uClipMin, position.z) * step(position.z, uClipMax);
 }`
 
 const POINT_FRAG = /* glsl */ `
 varying vec3 vColor;
+varying float vClip;
 void main() {
+  if (vClip < 0.5) discard;      // 高度切片：范围外的点不画
   vec2 c = gl_PointCoord - 0.5;
   float d = dot(c, c);
   if (d > 0.25) discard;          // 画成圆点
@@ -71,6 +79,9 @@ function makePoints(solid: boolean, color: number) {
       uZMax: { value: 2.5 },
       uColor: { value: new THREE.Color(color) },
       uSolid: { value: solid ? 1 : 0 },
+      uClipOn: { value: 0 },
+      uClipMin: { value: 0 },
+      uClipMax: { value: 0 },
     },
   })
   const pts = new THREE.Points(new THREE.BufferGeometry(), mat)
@@ -116,6 +127,8 @@ interface LineSync {
   obj: Line2
   buf: PointBuffer
   version: number
+  count: number // 上次重建时的点数
+  at: number // 上次重建的时刻（performance.now，ms）
 }
 
 function makeLine(color: number, dashed: boolean): Line2 {
@@ -128,13 +141,87 @@ function makeLine(color: number, dashed: boolean): Line2 {
 function syncLine(s: LineSync) {
   const b = s.buf
   if (b.version === s.version) return
+  const now = performance.now()
+  // 轨迹每走 2 cm 版本就 +1，重建却是整条线换几何体（长巡逻下上万点）：
+  // 点数还在涨时最多每 0.5 s 重建一次。version 故意不更新，下一帧还会重试。
+  if (b.count !== s.count && now - s.at < 500) return
   s.version = b.version
+  s.count = b.count
+  s.at = now
   if (b.count < 2) return
   const geo = new LineGeometry()
   geo.setPositions(b.data.subarray(0, b.count * 3))
   s.obj.geometry.dispose()
   s.obj.geometry = geo
   if ((s.obj.material as LineMaterial).dashed) s.obj.computeLineDistances()
+}
+
+// ---------------- 安全窗：veto 否决层的拦截几何（俯视投影，随小车转动） ----------------
+// 常量与 foxy_ws/veto_core.py 的 Params 逐项一致（11-05 G1 批标定），改动必须两边同步。
+// veto 只统计离地 0.20~0.75 m 高度带的点；这里画的是水平拦截半径（真·水平米，R1 语义）。
+const VETO = {
+  sensorH: 0.486,                       // 雷达离地高（veto_calib_probe 标定）
+  selfHalf: [0.25, 0.15] as const,      // 自体掩膜半宽 (x, y)：狗自己的点不算障碍
+  sectorHalf: (60 * Math.PI) / 180,     // 前向扇区半角
+  sectorR: 1.0,                         // 前扇区拦截半径
+  ringR: 0.55,                          // 侧后环拦截半径
+  nearKeep: 1.25,                       // 摄入上限：更远的点 veto 根本不看
+}
+
+/** 半径 r、方位角 az0→az1 的一段弧（方位角 0 = 车头 +x，+左，与 veto 的 az 同约定） */
+function arcPoints(r: number, az0: number, az1: number, n = 48): THREE.Vector3[] {
+  const pts: THREE.Vector3[] = []
+  for (let i = 0; i <= n; i++) {
+    const a = az0 + ((az1 - az0) * i) / n
+    pts.push(new THREE.Vector3(r * Math.cos(a), r * Math.sin(a), 0))
+  }
+  return pts
+}
+
+function makeVetoOverlay() {
+  const g = new THREE.Group()
+  const add = (obj: THREE.Object3D) => {
+    obj.renderOrder = 9 // 在点云之上、车身之下，半透明不写深度
+    g.add(obj)
+    return obj
+  }
+  const line = (pts: THREE.Vector3[], color: number, opacity: number, dashed = false) => {
+    const geo = new THREE.BufferGeometry().setFromPoints(pts)
+    const mat = dashed
+      ? new THREE.LineDashedMaterial({ color, transparent: true, opacity, dashSize: 0.07, gapSize: 0.05, depthWrite: false })
+      : new THREE.LineBasicMaterial({ color, transparent: true, opacity, depthWrite: false })
+    const l = new THREE.Line(geo, mat)
+    if (dashed) l.computeLineDistances()
+    return add(l)
+  }
+  // 前扇区（|az| ≤ 60°，拦截半径 1.0 m）：淡红填充 + 弧 + 两条半径边界
+  const shape = new THREE.Shape()
+  shape.moveTo(0, 0)
+  shape.absarc(0, 0, VETO.sectorR, -VETO.sectorHalf, VETO.sectorHalf, false)
+  shape.closePath()
+  const fill = new THREE.Mesh(
+    new THREE.ShapeGeometry(shape, 48),
+    new THREE.MeshBasicMaterial({ color: 0xef4444, transparent: true, opacity: 0.05, depthWrite: false, side: THREE.DoubleSide }),
+  )
+  add(fill)
+  line(arcPoints(VETO.sectorR, -VETO.sectorHalf, VETO.sectorHalf), 0xef4444, 0.9)
+  for (const s of [-1, 1]) {
+    line([new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3(VETO.sectorR * Math.cos(s * VETO.sectorHalf), VETO.sectorR * Math.sin(s * VETO.sectorHalf), 0)],
+      0xef4444, 0.4)
+  }
+  // 侧后环（|az| > 60°，拦截半径 0.55 m）：两个端点正好落在扇区边界线上
+  line(arcPoints(VETO.ringR, VETO.sectorHalf, 2 * Math.PI - VETO.sectorHalf, 64), 0xf59e0b, 0.9)
+  // 摄入上限 1.25 m：整圈灰线
+  line(arcPoints(VETO.nearKeep, 0, 2 * Math.PI, 96), 0x94a3b8, 0.5)
+  // 自体掩膜：狗身轮廓的黄色虚线框
+  const [hx, hy] = VETO.selfHalf
+  line([
+    new THREE.Vector3(-hx, -hy, 0), new THREE.Vector3(hx, -hy, 0),
+    new THREE.Vector3(hx, hy, 0), new THREE.Vector3(-hx, hy, 0), new THREE.Vector3(-hx, -hy, 0),
+  ], 0xeab308, 0.8, true)
+  g.visible = false
+  return g
 }
 
 // ---------------- 小车：白色车身 + 青色朝向箭头 + 向外扩散的扫描环 ----------------
@@ -193,6 +280,7 @@ let scanSync: PointSync
 let estSync: LineSync
 let gtSync: LineSync
 let robot: ReturnType<typeof makeRobot>
+let vetoOverlay: ReturnType<typeof makeVetoOverlay>
 let grid: THREE.GridHelper | null = null
 let gridKey = ''
 let raf = 0
@@ -321,11 +409,17 @@ function tick(t: number) {
     u.uOrtho.value = ortho1 ? 1 : 0
     u.uZMin.value = zmin
     u.uZMax.value = zmax
+    u.uClipOn.value = props.sliceRange ? 1 : 0
+    if (props.sliceRange) {
+      u.uClipMin.value = props.sliceRange[0]
+      u.uClipMax.value = props.sliceRange[1]
+    }
   }
 
   // 小车位姿 + 扫描环动画（2 s 一个周期）
   const pose = st?.pose
   robot.group.visible = !!pose
+  vetoOverlay.visible = props.layers.veto && !!pose
   if (pose) {
     robot.group.position.set(pose.x, pose.y, pose.z)
     robot.group.rotation.z = pose.yaw
@@ -372,9 +466,11 @@ onMounted(() => {
   mapSync = { obj: makePoints(false, 0), buf: s.map, version: -1, resets: -1, data: null, uploaded: 0 }
   scanSync = { obj: makePoints(true, 0x00b4d8), buf: s.scan, version: -1, resets: -1, data: null, uploaded: 0 }
   scanSync.obj.renderOrder = 2
-  estSync = { obj: makeLine(0x2563eb, false), buf: s.est, version: -1 }
-  gtSync = { obj: makeLine(0x8a97ad, true), buf: s.gt, version: -1 }
+  estSync = { obj: makeLine(0x2563eb, false), buf: s.est, version: -1, count: -1, at: -1e9 }
+  gtSync = { obj: makeLine(0x8a97ad, true), buf: s.gt, version: -1, count: -1, at: -1e9 }
   robot = makeRobot()
+  vetoOverlay = makeVetoOverlay()
+  robot.group.add(vetoOverlay) // 跟着小车平移 + 随朝向旋转
   scene.add(mapSync.obj, scanSync.obj, estSync.obj, gtSync.obj, robot.group)
 
   resizeObs = new ResizeObserver(resize)

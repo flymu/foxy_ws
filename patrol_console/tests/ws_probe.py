@@ -3,6 +3,8 @@
 覆盖：
   REST   /api/status /api/stacks /api/mapping/presets /api/stacks/{name}/log 404
   WS     mapping_reset / mapping 状态字段 / 二进制帧格式与体素连续性
+  导出   /api/mapping/export 落盘 npz+PCD、非法名 400、历史列表、
+         载入 → epoch 变更 + mapping_reset + 新 epoch 整图重发
   遥控   10Hz 指令落到 /cmd_vel_intent、看门狗 0.5s 自动零速、
          急停锁定、解除、规划器在场时 busy 拒绝（互斥门）
 用法（容器内，已 source ROS，PYTHONPATH 含 pydeps）：
@@ -115,6 +117,52 @@ def main():
         check('二进制帧 ≥6 且长度全对', len(frames) >= 6 and all(ok for _, ok in frames),
               f"{len(frames)} 帧, 类型 {sorted(set(h['type'] for h, _ in frames))}")
         check('体素帧 offset 连续', len(offsets) >= 1)
+        return got_reset, mapping
+
+    async def export_run(ws, cur_epoch):
+        """导出/历史/载入三件套。synth 在跑：地图一直在长，断言只做下限。"""
+        _, info = rest('/api/mapping/export?name=probe_map', 'POST')
+        check('导出: 返回形状', info.get('name') == 'probe_map' and info['points'] > 0
+              and info['npz'].endswith('probe_map.npz') and info['pcd'].endswith('probe_map.pcd'),
+              f"points={info.get('points')}")
+        # 非法名（路径穿越/非法字符）必须 400，而不是落盘
+        try:
+            rest('/api/mapping/export?name=../evil', 'POST')
+            check('导出: 非法名被拒', False)
+        except urllib.error.HTTPError as e:
+            check('导出: 非法名被拒', e.code == 400
+                  and json.loads(e.read())['detail']['code'] == 'bad_export_name')
+        # 文件真的落在 exports 目录里（探针和控制台同容器，直接看文件）
+        import os
+        stem = '/home/mu/foxy_ws/patrol_console/data/exports/probe_map'
+        check('导出: npz + PCD 落盘', os.path.isfile(stem + '.npz') and os.path.isfile(stem + '.pcd')
+              and os.path.getsize(stem + '.pcd') > 100, stem)
+        _, lst = rest('/api/mapping/exports')
+        check('历史: 列表含本存档', any(x['name'] == 'probe_map' and x['points'] > 0
+                                      for x in lst['exports']), str(lst['exports'])[:120])
+        # 载入：epoch 变更，WS 端应看到新 epoch 的 mapping_reset + 整图重发
+        _, loaded = rest('/api/mapping/exports/probe_map/load', 'POST')
+        new_epoch = loaded['epoch']
+        check('载入: 返回形状', loaded['name'] == 'probe_map' and loaded['voxels'] > 0
+              and new_epoch > cur_epoch, f"epoch {cur_epoch}->{new_epoch}, voxels={loaded['voxels']}")
+        reset_epoch, total_map = None, 0
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and (reset_epoch is None or total_map < loaded['voxels']):
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            if isinstance(msg, bytes):
+                (hlen,) = struct.unpack_from('<I', msg, 0)
+                head = json.loads(msg[4:4 + hlen])
+                if head['epoch'] == new_epoch and head['type'] == 'map':
+                    total_map += head['count']
+            else:
+                m = json.loads(msg)
+                if m.get('type') == 'mapping_reset':
+                    reset_epoch = m['epoch']
+        # synth 还在长地图，新 epoch 期间会继续追加，总数只会 ≥ 存档体素数
+        check('载入: 新 epoch mapping_reset', reset_epoch == new_epoch,
+              f"reset={reset_epoch}")
+        check('载入: 整图重发到位', total_map >= loaded['voxels'],
+              f"{total_map}/{loaded['voxels']}")
 
     async def teleop_run(ws):
         # 12 条 10Hz 遥控指令 → /cmd_vel_intent 上应看到一串 v≈0.3
@@ -169,7 +217,8 @@ def main():
 
     async def amain():
         async with websockets.connect(WS_URL, max_size=None) as ws:
-            await ws_run(ws)
+            epoch0, _ = await ws_run(ws)
+            await export_run(ws, epoch0)
             await teleop_run(ws)
 
     asyncio.run(amain())

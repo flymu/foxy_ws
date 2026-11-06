@@ -31,7 +31,7 @@ onBeforeUnmount(stream.stop)
 // 图层、相机模式、点大小、场景、移动方式保存在浏览器里，下次打开沿用；
 // 地址里的 ?view=top、?move=teleop 可以直接指定相机模式和移动方式
 
-const LAYERS: LayerKey[] = ['map', 'scan', 'est', 'gt', 'grid']
+const LAYERS: LayerKey[] = ['map', 'scan', 'est', 'gt', 'grid', 'veto']
 const MODES: ViewMode[] = ['follow', 'free', 'top']
 const MOVES = ['teleop', 'waypoints'] as const
 type MoveMode = (typeof MOVES)[number]
@@ -44,7 +44,7 @@ const saved = (() => {
   }
 })()
 const route = useRoute()
-const layers = reactive<Record<LayerKey, boolean>>({ map: true, scan: true, est: true, gt: false, grid: true, ...saved.layers })
+const layers = reactive<Record<LayerKey, boolean>>({ map: true, scan: true, est: true, gt: false, grid: true, veto: false, ...saved.layers })
 const mode = ref<ViewMode>(
   MODES.find((m) => m === route.query.view) ?? (MODES.includes(saved.mode) ? saved.mode : 'free'),
 )
@@ -54,14 +54,22 @@ const chosenSlam = ref<string>(typeof saved.slam === 'string' ? saved.slam : '')
 const moveMode = ref<MoveMode>(
   MOVES.find((m) => m === route.query.move) ?? (MOVES.includes(saved.move) ? saved.move : 'waypoints'),
 )
+// 高度切片：只显示 z 在范围内的点（默认关）。开的时候初始化为整个高度范围，
+// 「veto 带」一键切到 veto 真正统计的离地 0.20~0.75 m 层。
+const sliceOn = ref<boolean>(typeof saved.sliceOn === 'boolean' ? saved.sliceOn : false)
+const sliceZ = ref<[number, number] | null>(
+  Array.isArray(saved.sliceZ) && saved.sliceZ.length === 2 && saved.sliceZ.every((v: unknown) => typeof v === 'number')
+    ? [saved.sliceZ[0], saved.sliceZ[1]]
+    : null,
+)
 const viewer = ref<InstanceType<typeof PointCloudView> | null>(null)
-watch([layers, mode, pointSize, chosen, chosenSlam, moveMode], () => {
+watch([layers, mode, pointSize, chosen, chosenSlam, moveMode, sliceOn, sliceZ], () => {
   try {
     localStorage.setItem(
       VIEW_KEY,
       JSON.stringify({
         layers, mode: mode.value, pointSize: pointSize.value, preset: chosen.value, slam: chosenSlam.value,
-        move: moveMode.value,
+        move: moveMode.value, sliceOn: sliceOn.value, sliceZ: sliceZ.value,
       }),
     )
   } catch {
@@ -84,6 +92,96 @@ const zRange = computed(() => {
   const e = ms.value?.extent
   return e ? [e[2], Math.min(e[5], e[2] + 4)] : null
 })
+// 高度切片传给 3D 视图的范围：关 = null；开 = sliceZ 收进地图范围
+const sliceRange = computed<[number, number] | null>(() => {
+  if (!sliceOn.value) return null
+  const zr = zRange.value
+  if (!zr) return null
+  const s = sliceZ.value ?? [zr[0], zr[1]]
+  const lo = Math.min(Math.max(s[0], zr[0]), zr[1])
+  const hi = Math.min(Math.max(s[1], zr[0]), zr[1])
+  return [Math.min(lo, hi), Math.max(lo, hi)]
+})
+// 开切片时还没有范围就用当前地图范围兜底（地图范围后来才出来也一样）
+watch([sliceOn, zRange], ([on, zr]) => {
+  if (on && zr && !sliceZ.value) sliceZ.value = [zr[0], zr[1]]
+})
+// 「veto 带」：切到 veto 真正统计的离地 0.20~0.75 m 层（雷达离地 0.486 m，
+// 与 veto_core.py 的 PRIOR_H 标定一致）。看膝盖高的"神秘障碍"就靠它把地板挡掉。
+function applyVetoBand() {
+  const p = ms.value?.pose
+  if (!p) return
+  sliceOn.value = true
+  sliceZ.value = [p.z - 0.486 + 0.2, p.z - 0.486 + 0.75]
+}
+
+// ---------------- 地图导出 / 历史载入 ----------------
+// 体素地图只活在控制台进程内存里：导出=一键落盘（npz+PCD），载入=把存档读回
+// 内存查看。狗断电、控制台重启前先导出，现场不丢（11-07 排查神秘障碍全靠这个）。
+
+const exporting = ref(false)
+const exportDir = ref('')
+async function exportMap() {
+  if (exporting.value) return
+  exporting.value = true
+  try {
+    const r = await api.exportMap()
+    ElMessage.success(t('mapping.tools.exported', { points: fmtCount(r.points), name: r.name }))
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    exporting.value = false
+  }
+}
+
+interface ExportItem { name: string; points: number; est: number; wall: number }
+const historyOpen = ref(false)
+const exportList = ref<ExportItem[]>([])
+const historyLoading = ref(false)
+const loadingMap = ref('')
+watch(historyOpen, (open) => {
+  if (open) loadExportList()
+})
+async function loadExportList() {
+  historyLoading.value = true
+  try {
+    const r = await api.listExports()
+    exportList.value = r.exports
+    exportDir.value = r.dir
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    historyLoading.value = false
+  }
+}
+async function loadExport(item: ExportItem) {
+  if (loadingMap.value) return
+  try {
+    await ElMessageBox.confirm(
+      t('mapping.tools.loadConfirm', { name: item.name, points: fmtCount(item.points) }),
+      t('mapping.tools.history'),
+      { type: 'warning', confirmButtonText: t('mapping.tools.load'), cancelButtonText: t('mapping.steps.cancel') },
+    )
+  } catch {
+    return
+  }
+  loadingMap.value = item.name
+  try {
+    const r = await api.loadExport(item.name)
+    historyOpen.value = false
+    // 后端会推新 epoch 的 mapping_reset，画面自动清屏重收整图，不用手动刷新
+    ElMessage.success(t('mapping.tools.loaded', { name: r.name, points: fmtCount(r.voxels) }))
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    loadingMap.value = ''
+  }
+}
+function fmtWall(wall: number): string {
+  const d = new Date(wall * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
 
 // ---------------- 进程（步骤 ①②③） ----------------
 
@@ -439,7 +537,7 @@ function metricTip(key: string): string | null {
     <div class="main">
       <!-- 3D 视图 -->
       <section class="viewport glass">
-        <PointCloudView ref="viewer" :stream="stream" :layers="layers" :mode="mode" :point-size="pointSize" />
+        <PointCloudView ref="viewer" :stream="stream" :layers="layers" :mode="mode" :point-size="pointSize" :slice-range="sliceRange" />
 
         <div class="hud tl">
           <button
@@ -459,6 +557,35 @@ function metricTip(key: string): string | null {
           <button class="icon-btn" :title="t('mapping.views.reset')" @click="viewer?.resetView()">
             <el-icon :size="16"><Aim /></el-icon>
           </button>
+          <button class="icon-btn" :disabled="exporting || !store.connected" :title="t('mapping.tools.export')" @click="exportMap">
+            <el-icon :size="16"><Download /></el-icon>
+          </button>
+          <el-popover
+            v-model:visible="historyOpen" placement="bottom-end" :width="300" trigger="click" :teleported="false"
+            :popper-style="{ padding: '8px' }"
+          >
+            <template #reference>
+              <button class="icon-btn" :title="t('mapping.tools.history')">
+                <el-icon :size="16"><FolderOpened /></el-icon>
+              </button>
+            </template>
+            <div class="exports">
+              <div class="exports-head">
+                <b>{{ t('mapping.tools.history') }}</b>
+                <span v-if="exportDir" class="k mono" :title="exportDir">{{ exportDir }}</span>
+              </div>
+              <div v-if="historyLoading" class="exports-empty mono">…</div>
+              <div v-else-if="!exportList.length" class="exports-empty">{{ t('mapping.tools.empty') }}</div>
+              <button
+                v-for="e in exportList" :key="e.name" class="export-row" :disabled="!!loadingMap"
+                @click="loadExport(e)"
+              >
+                <span class="name mono">{{ e.name }}</span>
+                <span class="meta">{{ t('mapping.tools.rowMeta', { points: fmtCount(e.points), wall: fmtWall(e.wall) }) }}</span>
+                <el-icon v-if="loadingMap === e.name" :size="13" class="spin"><Loading /></el-icon>
+              </button>
+            </div>
+          </el-popover>
         </div>
 
         <div v-if="dupTopics.length" class="alert" role="alert">
@@ -486,6 +613,23 @@ function metricTip(key: string): string | null {
           <div class="size">
             <span class="k">{{ t('mapping.hud.pointSize') }}</span>
             <el-slider v-model="pointSize" :min="0.5" :max="3" :step="0.25" :show-tooltip="false" size="small" />
+          </div>
+          <div v-if="zRange" class="slice">
+            <button
+              class="slice-btn" :class="{ on: sliceOn }" :title="t('mapping.tips.slice')"
+              :aria-pressed="sliceOn" @click="sliceOn = !sliceOn"
+            >
+              <el-icon :size="13"><Scissor /></el-icon>{{ t('mapping.slice.label') }}
+            </button>
+            <button
+              class="slice-btn" :disabled="!pose" :title="t('mapping.tips.vetoBand')" @click="applyVetoBand"
+            >
+              {{ t('mapping.slice.vetoBand') }}
+            </button>
+            <el-slider
+              v-if="sliceOn && sliceZ" v-model="sliceZ" range :min="zRange[0]" :max="zRange[1]"
+              :step="0.05" :show-tooltip="false" size="small"
+            />
           </div>
         </div>
 
@@ -802,7 +946,9 @@ function metricTip(key: string): string | null {
 .br {
   right: 16px;
   bottom: 14px;
-  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px 12px;
   padding: 4px 12px;
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.72);
@@ -852,6 +998,8 @@ function metricTip(key: string): string | null {
 .layer.est .swatch { height: 3px; background: #2563eb; }
 .layer.gt .swatch { height: 0; border-top: 2px dashed #8a97ad; border-radius: 0; }
 .layer.grid .swatch { background: repeating-linear-gradient(90deg, #9db4cc 0 1px, transparent 1px 4px), repeating-linear-gradient(0deg, #9db4cc 0 1px, transparent 1px 4px); }
+/* veto 安全窗：120° 红扇形 = 前向拦截区，浅红底 = 侧后环形区 */
+.layer.veto .swatch { background: conic-gradient(from 300deg, #ef4444 0 120deg, rgba(239, 68, 68, 0.12) 120deg 360deg); }
 
 /* 分段按钮（相机模式、移动方式） */
 .seg {
@@ -928,6 +1076,121 @@ function metricTip(key: string): string | null {
 }
 .size .el-slider {
   width: 84px;
+}
+
+/* 高度切片行（右下角）：开关 + 「veto 带」一键 + 双端滑条 */
+.slice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.slice-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink-3);
+  background: rgba(255, 255, 255, 0.55);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.slice-btn.on {
+  color: #b91c1c;
+  background: #fff;
+  box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.35), 0 4px 12px -6px rgba(239, 68, 68, 0.45);
+}
+.slice-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.slice .el-slider {
+  width: 130px;
+}
+.slice-btn:focus-visible,
+.export-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 历史地图浮层（:teleported=false，挂在组件内，scoped 样式能作用到） */
+.exports {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 320px;
+  overflow: auto;
+}
+.exports-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px 6px;
+}
+.exports-head b {
+  font-size: 12.5px;
+}
+.exports-head .k {
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.exports-empty {
+  padding: 12px 4px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+  text-align: center;
+}
+.export-row {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 8px;
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+.export-row:hover:not(:disabled) {
+  background: rgba(8, 145, 178, 0.08);
+}
+.export-row:disabled {
+  cursor: default;
+}
+.export-row .name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.export-row .meta {
+  font-size: 11.5px;
+  color: var(--ink-3);
+}
+.export-row .spin {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  color: var(--accent);
+  animation: exports-spin 1s linear infinite;
+}
+@keyframes exports-spin {
+  from { transform: translateY(-50%) rotate(0deg); }
+  to { transform: translateY(-50%) rotate(360deg); }
 }
 
 /* 多个 SLAM 同时发布时的警告 */

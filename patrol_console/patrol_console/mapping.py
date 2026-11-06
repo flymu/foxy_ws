@@ -88,6 +88,14 @@ def encode(head, pts):
     return struct.pack('<I', len(h)) + h + np.ascontiguousarray(pts, np.float32).tobytes()
 
 
+def write_pcd(path, xyz):
+    """ASCII PCD（只有 x y z），CloudCompare / RViz 直接可开。"""
+    with open(path, 'w') as f:
+        f.write('# .PCD v0.7 - ASCII\nFIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\n')
+        f.write(f'WIDTH {len(xyz)}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS {len(xyz)}\nDATA ascii\n')
+        np.savetxt(f, xyz, fmt='%.4f')
+
+
 def yaw_of(q):
     return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
 
@@ -272,6 +280,98 @@ class MappingData:
         with self._lock:
             return self._map.data[:self._map.n].copy()
 
+    # ======================= 导出 / 载入 =======================
+
+    def export(self, directory, name=None):
+        """把当前体素地图和轨迹存成 npz + ASCII PCD，返回摘要；地图为空返回 None。
+
+        内存地图的唯一即时落盘通道（Point-LIO 自己的落盘要停栈才有）：网页「导出地图」
+        按钮调用。锁内只做拷贝，写盘放锁外，不卡 0.2s 一次的状态推送。
+        """
+        with self._lock:
+            if self._map.n == 0:
+                return None
+            if name is None:
+                name = time.strftime('map_%m%d_%H%M%S')
+            m = self._map.data[:self._map.n].copy()
+            est = self._est.data[:self._est.n].copy()
+            gt = self._gt.data[:self._gt.n].copy()
+            # 位姿没有就存空数组（npz 存 None 要走 object dtype，allow_pickle 读不了）
+            pose = np.array(self._pose) if self._pose is not None else np.zeros(0)
+        os.makedirs(directory, exist_ok=True)
+        stem = os.path.join(directory, name)
+        np.savez(stem + '.npz', map=m, est=est, gt=gt, pose=pose,
+                 voxel=self.voxel, frame=self.frame, wall=time.time())
+        write_pcd(stem + '.pcd', m)
+        return {'name': name, 'points': int(len(m)), 'est': int(len(est)), 'gt': int(len(gt)),
+                'npz': stem + '.npz', 'pcd': stem + '.pcd'}
+
+    def list_exports(self, directory):
+        """exports 目录里的存档列表（新→旧）。坏文件跳过并告警，不挡整个列表。"""
+        out = []
+        if not os.path.isdir(directory):
+            return out
+        for fn in sorted(os.listdir(directory), reverse=True):
+            if not fn.endswith('.npz'):
+                continue
+            path = os.path.join(directory, fn)
+            try:
+                with np.load(path, allow_pickle=False) as d:
+                    out.append({'name': fn[:-4], 'points': int(len(d['map'])),
+                                'est': int(d['est'].shape[0]) if 'est' in d.files else 0,
+                                'wall': float(d['wall']) if 'wall' in d.files
+                                        else os.path.getmtime(path)})
+            except Exception as e:
+                self._log.warn(f'跳过无法读取的存档 {fn}：{e!r}')
+        return out
+
+    def load(self, path):
+        """把 export 存的 npz 读回内存：epoch 加 1，网页自动清屏重收整图。
+
+        只替换显示用的内存地图，不碰 SLAM 进程。_wall_last 不动 → initialized 仍是
+        False：载入旧图绝不能解锁遥控（网页的遥控门看的就是 initialized）。
+        兼容 tests/map_rescue.py 的救援格式（位姿存在 status JSON 字符串里）。
+        """
+        with np.load(path, allow_pickle=False) as d:
+            m = np.ascontiguousarray(d['map'], dtype=np.float32).reshape(-1, 3)
+            if len(m) == 0:
+                raise ValueError('存档里没有地图点')
+
+            def traj(key):
+                return (np.ascontiguousarray(d[key], dtype=np.float32).reshape(-1, 3)
+                        if key in d.files and len(d[key]) else np.zeros((0, 3), np.float32))
+
+            est, gt = traj('est'), traj('gt')
+            pose = None
+            if 'pose' in d.files and d['pose'].size == 4:
+                pose = tuple(float(v) for v in d['pose'])
+            elif 'status' in d.files:          # map_rescue.py 的救援格式
+                try:
+                    p = json.loads(str(d['status'])).get('pose')
+                    if p:
+                        pose = (float(p['x']), float(p['y']), float(p['z']), float(p['yaw']))
+                except (ValueError, AttributeError, KeyError, TypeError):
+                    pass
+        with self._lock:
+            self._clear()
+            k, _ = voxel_keys(m, self.voxel)   # 存档点就是体素中心，能重建出同一套体素键
+            self._keys = set(k[k >= 0].tolist())
+            self._map = PointBuffer(max(4096, len(m)))
+            self._map.append(m)
+            self._lo = m.min(axis=0)
+            self._hi = m.max(axis=0)
+            if len(est):
+                self._est = PointBuffer(max(4096, len(est)))
+                self._est.append(est)
+            if len(gt):
+                self._gt = PointBuffer(max(4096, len(gt)))
+                self._gt.append(gt)
+            if pose is not None:
+                self._pose = pose
+            epoch = self.epoch
+        return {'epoch': epoch, 'voxels': int(len(m)), 'est': int(len(est)),
+                'gt': int(len(gt)), 'pose': pose}
+
     def export_run(self, directory):
         """在同一把锁内刷新并复制当前运行记录，避免复制到半行轨迹。"""
         import os
@@ -446,7 +546,10 @@ class MappingData:
                 extent = [round(float(v), 2) for v in (*self._lo, *self._hi)]
             return {
                 'type': 'mapping', 'epoch': self.epoch, 'frame': self.frame, 'voxel': self.voxel,
-                'pose': pose, 'speed': round(self._speed, 3), 'initialized': self._pose is not None,
+                # initialized = 里程计活着（3 s 内还有新数据），不能只看 _pose 有没有：
+                # 载入历史地图也会填 _pose，那时里程计并不活着，绝不能据此解锁遥控
+                'pose': pose, 'speed': round(self._speed, 3),
+                'initialized': self._pose is not None and time.monotonic() - self._wall_last <= 3.0,
                 'duration': None if self._t0 is None else round(self._t_last - self._t0, 1),
                 'length': round(self._length, 2), 'voxels': self._map.n, 'extent': extent,
                 'error': None if self._error is None else round(self._error, 3),

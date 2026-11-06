@@ -84,6 +84,18 @@ export const api = {
   stopNavSim: () => request<unknown>('POST', '/api/navigation/sim/stop'),
   restartNavSim: (map: string) => request<unknown>('POST', `/api/navigation/sim/restart?name=${encodeURIComponent(map)}`),
   mappingPresets: () => request<MappingPreset[]>('GET', '/api/mapping/presets'),
+  /** 把控制台内存里的体素地图即时存盘（npz + PCD）；points 为体素数 */
+  exportMap: (name?: string) =>
+    request<{ name: string; points: number; est: number; gt: number; npz: string; pcd: string; dir: string }>(
+      'POST', `/api/mapping/export${name ? `?name=${encodeURIComponent(name)}` : ''}`),
+  /** 已导出的存档列表（新→旧） */
+  listExports: () =>
+    request<{ dir: string; exports: { name: string; points: number; est: number; wall: number }[] }>(
+      'GET', '/api/mapping/exports'),
+  /** 把存档载回控制台内存：当前内存地图被替换，新 epoch 推送后页面自动清屏重收 */
+  loadExport: (name: string) =>
+    request<{ name: string; epoch: number; voxels: number; est: number; gt: number; pose: { x: number; y: number; z: number; yaw: number } | null }>(
+      'POST', `/api/mapping/exports/${encodeURIComponent(name)}/load`),
   /** Delete an uploaded scene (custom_*); the backend moves its folder to the scenes trash */
   deleteScene: (preset: string) =>
     request<{ name: string; trash: string }>('DELETE', `/api/mapping/presets/${encodeURIComponent(preset)}`),

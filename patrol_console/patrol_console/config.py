@@ -182,9 +182,10 @@ def load(path=None):
 
     # Data folders default to data_root; every path is made absolute here so the modules can use it as is
     mapping = cfg['mapping'] = cfg.get('mapping') or {}
-    for key, sub in (('maps_dir', 'maps'), ('runs_dir', 'runs'), ('scenes_dir', 'scenes')):
+    for key, sub in (('maps_dir', 'maps'), ('runs_dir', 'runs'), ('scenes_dir', 'scenes'),
+                     ('exports_dir', 'exports')):
         mapping.setdefault(key, '${data_root}/' + sub)
-    for key in ('maps_dir', 'runs_dir', 'scenes_dir', 'pcd_path'):
+    for key in ('maps_dir', 'runs_dir', 'scenes_dir', 'exports_dir', 'pcd_path'):
         if mapping.get(key):
             mapping[key] = expand(mapping[key])
     if mapping.get('slam_profiles'):

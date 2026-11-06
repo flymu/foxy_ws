@@ -44,7 +44,7 @@ docker exec -d foxy-live bash -c "setsid bash -c 'source /opt/ros/foxy/setup.bas
 docker exec foxy-live bash -c "pkill -f 'patrol_console[.]main'"      # SIGINT 优雅退出
 docker exec foxy-live bash -c "pkill -f 'synth_publisher[.]py'"
 
-# 冒烟回归（26 断言：REST/WS/二进制帧/遥控闭环/急停/互斥门）
+# 冒烟回归（33 断言：REST/WS/二进制帧/导出-历史-载入/遥控闭环/急停/互斥门）
 docker exec foxy-live bash -c 'source /opt/ros/foxy/setup.bash && \
   export PYTHONPATH=/home/mu/foxy_ws/patrol_console/pydeps:$PYTHONPATH && \
   python3 /home/mu/foxy_ws/patrol_console/tests/ws_probe.py'
@@ -54,13 +54,17 @@ docker exec foxy-live bash -c 'source /opt/ros/foxy/setup.bash && \
 （产物在 `web/dist`，后端启动时自动找它；仓库里带着已构建的 dist，容器里不需要 node）。
 
 日志：`patrol_console/data/console.log`；每条建图的轨迹记录在 `patrol_console/data/runs/`
-（est.tum / run.json，与上游格式一致）。
+（est.tum / run.json，与上游格式一致）。网页「导出地图」的档案在
+`patrol_console/data/exports/`（npz + ASCII PCD，同名导出会覆盖），「历史地图」里可一键载回。
 
 ## 页面与真机流程的对应
 
 | 页面元素 | 真机栈语义 |
 |---|---|
 | 建图页 3D 视图 | `/cloud_registered` 体素地图（frame `camera_init`）+ 估计轨迹 + 当前帧 |
+| 「安全窗」图层 | veto 拦截几何叠加在狗身上：前扇区 ±60°@1.0 m（红）、侧后环 0.55 m（橙）、近距圈 1.25 m（灰）、自体屏蔽框，随狗位姿实时转动。排查"神秘障碍"时开着它看 veto 到底在拦哪块 |
+| 「高度切片 / veto 带」（右下） | 只显示 z 在范围内的点（GPU shader 裁剪，不动数据）；「veto 带」一键切到 veto 真正统计的离地 0.20~0.75 m 层，滤掉地板看膝盖高矮物 |
+| 「导出地图 / 历史地图」（右上） | 内存地图一键落盘 npz+PCD（`data/exports/`）；载入=读回内存查看，新 epoch 自动整图重发。狗断电/控制台重启前先导出，现场不丢 |
 | 「① SLAM」卡片 | 启动**纯 Point-LIO**（stacks.yaml 白名单唯一进程）。停止时 LIO 自动把地图落盘 `/tmp/lio_<时间>_global_map.pcd`（`map_save_path:=/tmp`），**停止建图即存图** |
 | 「② 移动」卡片 | 遥控（摇杆/WASD，10Hz），见下方安全设计 |
 | 系统监控页 | 话题频率/发布者数/节点列表/TF/CPU 内存，话题清单在 console.yaml `topics` |
@@ -78,6 +82,9 @@ docker exec foxy-live bash -c 'source /opt/ros/foxy/setup.bash && \
 
 - **限幅**：`teleop.max_v=0.4 / max_w=1.0`；推荐速度带 `[0.25, 0.4]`（狗实测 0.20~0.25
   以下原地假死，见 11-04），滑条上画出来，超速会红字提示。
+- **遥控门 = 里程计活着**：状态里的 `initialized` 要求 3 s 内还有新里程计数据，而不是
+  "位姿字段非空"。从「历史地图」载入存档只填位姿、不碰这个门——**载入旧图绝不能解锁
+  遥控**（想象操作者载入旧图就开走，狗位姿其实完全是另一样）。载入只用于查看。
 - **0.5 s 看门狗**：网页断开、切页、卡死，后端立刻补发零速度（`teleop.timeout`）。
 - **断开即停**：每个连接断开时若正在遥控，立即停车。
 - **规划器互斥**：`/cmd_vel_intent` 上有**别的节点**在发速度（自主导航中）时遥控直接拒绝
@@ -111,7 +118,8 @@ fastapi 0.124.4 + uvicorn 0.33.0 在 py3.8 下工作正常（pydeps 里 pip 自�
 已知边界 / 后续可做：
 
 1. **网页保存地图卡隐藏**：Point-LIO 是退出落盘，停止建图即存图（见上表）。要网页保存
-   （存到地图库目录、生成 2D 栅格）需要把上游 `map_library` 移植过来。
+   （存到地图库目录、生成 2D 栅格）需要把上游 `map_library` 移植过来。「导出地图」是
+   **显示用档案**（npz+PCD，载回只影响 3D 视图），不是导航地图库——两者别混。
 2. **急停不接 `clearTarget`**：把急停同时接到规划器的 clearTarget 服务，能让软急停变硬
    停（规划栈被真正清目标）。涉及改我们的规划器/安全栈，属于安全链变更，谨慎做。
 3. **监控话题刻意不含 `/livox/points2`**：那是 Orin 发来的 32Mbps 级大流，从 WS 再订一路

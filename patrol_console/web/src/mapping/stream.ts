@@ -107,8 +107,8 @@ export class PointBuffer {
   }
 }
 
-/** 3D 视图的图层和相机模式 */
-export type LayerKey = 'map' | 'scan' | 'est' | 'gt' | 'grid'
+/** 3D 视图的图层和相机模式（veto = 安全窗拦截几何，随小车朝向转动） */
+export type LayerKey = 'map' | 'scan' | 'est' | 'gt' | 'grid' | 'veto'
 export type ViewMode = 'follow' | 'free' | 'top'
 
 export type MappingStream = ReturnType<typeof createMappingStream>

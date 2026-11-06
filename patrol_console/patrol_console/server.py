@@ -17,6 +17,7 @@ patrol_console 裁剪版：去掉上游的仿真场景 / 地图库 / 导航 / �
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 from typing import Optional
@@ -29,6 +30,7 @@ from .process_manager import StackRunning
 
 STREAMS = {'mapping'}       # 网页可以订阅的数据流；不订阅就不发（监控页不需要点云）
 STREAM_PERIOD = 0.2         # 订阅的数据流多久推送一次（s）
+EXPORT_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')   # 导出存档名（也挡住路径穿越）
 
 
 def create_app(cfg, node, procs, mapping, teleop):
@@ -42,6 +44,8 @@ def create_app(cfg, node, procs, mapping, teleop):
         return '~' + path[len(home):] if path == home or path.startswith(home + '/') else path
     # Data folders shown on the pages (they come from the configuration, so the page must not hard-code them)
     paths_shown = {'maps': shown(cfg['mapping']['maps_dir']), 'runs': shown(cfg['mapping']['runs_dir'])}
+    # 导出存档目录（网页「导出地图」/「历史地图」）
+    exports_dir = cfg['mapping'].get('exports_dir') or os.path.join(cfg['mapping']['runs_dir'], 'exports')
 
     def status():
         snap = node.snapshot()
@@ -75,6 +79,38 @@ def create_app(cfg, node, procs, mapping, teleop):
     @app.get('/api/mapping/presets')
     def get_presets():
         return []       # 无仿真场景；前端据此自动隐藏航点模式
+
+    # ---------------- 内存地图的导出 / 载入 ----------------
+    # 体素地图只活在控制台进程内存里，进程一死就没了。导出=即时落盘（npz+PCD），
+    # 载入=把存档读回内存（新 epoch，网页自动清屏重收）。狗断电、控制台重启
+    # 前先导出，现场不丢（11-07 神秘障碍物排查就是靠 WS 手工救援才保住的）。
+
+    @app.post('/api/mapping/export')
+    def export_map(name: Optional[str] = None):
+        if name is not None and not EXPORT_RE.match(name):
+            raise error(400, 'bad_export_name', name=name)
+        info = mapping.export(exports_dir, name)
+        if info is None:
+            raise error(409, 'map_empty')
+        info['dir'] = shown(exports_dir)
+        return info
+
+    @app.get('/api/mapping/exports')
+    def list_exports():
+        return {'dir': shown(exports_dir), 'exports': mapping.list_exports(exports_dir)}
+
+    @app.post('/api/mapping/exports/{name}/load')
+    def load_export(name: str):
+        if not EXPORT_RE.match(name):
+            raise error(404, 'export_not_found', name=name)
+        path = os.path.join(exports_dir, name + '.npz')
+        if not os.path.isfile(path):
+            raise error(404, 'export_not_found', name=name)
+        try:
+            info = mapping.load(path)
+        except Exception as e:
+            raise error(500, 'load_failed', reason=repr(e))
+        return {'name': name, **info}
 
     @app.post('/api/stacks/{name}/start')
     def start_stack(name: str, origin: Optional[str] = None):
