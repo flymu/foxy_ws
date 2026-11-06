@@ -16,7 +16,7 @@ rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port*
 nohup /home/mu/foxy_ws/install_x86/point_lio_ros2/lib/point_lio_ros2/point_lio_node \
     --ros-args -p config_file:=/home/mu/workspace/Point-LIO/config/mid360.yaml \
     -p map_save_path:=/tmp > $D.lio.log 2>&1 &
-nohup python3 bbs_scan_dump.py > $D.dump.log 2>&1 &
+nohup python3 /home/mu/foxy_ws/probes/bbs_scan_dump.py > $D.dump.log 2>&1 &
 sleep 3
 nohup ros2 bag play /home/mu/bags/campus_map > $D.bag.log 2>&1 &
 # dump 节点按窗自退（bag 226s@1.0x，末窗 200s+1s+余量）；保险网 300s

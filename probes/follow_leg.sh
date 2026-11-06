@@ -3,6 +3,6 @@
 source /opt/ros/foxy/setup.bash
 for i in $(seq 1 26); do
   printf "[%02d] " "$i"
-  timeout 6 python3 /home/mu/foxy_ws/health_pose_probe.py
+  timeout 6 python3 /home/mu/foxy_ws/probes/health_pose_probe.py
   sleep 4
 done

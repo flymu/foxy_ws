@@ -8,22 +8,25 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 
 | 内容 | 文件 |
 |---|---|
-| 狗控制桥（工作站→cmd_vel→SDK2 RPC） | `go2_bridge.py` `go2_bridge_start.sh`（部署到 Orin）`motion_test.py` |
+| 狗控制桥（工作站→cmd_vel→SDK2 RPC） | `go2_bridge.py` `go2_bridge_start.sh`（部署到 Orin）`archive/motion_test.py` |
 | 四足解算位姿桥（固件 /lf/sportmodestate→`/go2/odom`，两段接力） | `go2_odom_bridge.py`（Orin，第1段：cyclone 钉 eth1 直订主板）`go2_odom_republish.py`（第2段：默认 FastDDS 栈跨栈透传给工作站）`go2_odom_start.sh`（两段一键启停）`dog_odom_sim.py`（离线验证器） |
-| 巡逻栈一键启停（foxy-live 容器内） | `live_stack_start.sh` `live_stack_stop.sh` `pose_dump.py`（位姿连续性检查） `doctor.py`（全链路只读体检：各级速率/健康语义，异常非零退出） |
-| **独立避障否决层**（最后防线，P0-S） | `obstacle_veto.py`（数据流：`/cmd_vel_intent`→speed_adapter→`/cmd_vel_raw`→否决→`/go2/cmd_vel`）`veto_core.py`（G1 无 ROS 决策核心：R1 真距离/R2 不增速/R3 戳闸）`speed_adapter.py`（运动适配器：起步地板 0.25/停步死区，G1 起 veto 不再越权抬速）`bridge_core.py` + `go2_bridge.py` v4（R4 停车锁存仲裁）`test_veto_regression.py`（R1-R4 无 ROS 回归，53 断言）`test_veto_offline.py`（bag 回放集成测试，非零退出码）`e2e_replay_run.sh`（E2E 回放链一键 runner，docker exec -d 脱离会话）`orin_deploy/push_safety.sh`（G1 副本一键推 Orin，狗断电期间改完防忘推）`veto_calib_probe.py`（安装几何标定）`capture_frames.py`（原始帧采集）`veto_status_snoop.py`（Orin 上拉 /veto/status——daemon 瞎）`tf_snoop.py` `veto_selfmask_probe.py`（体素掩膜法，已弃用留档）`probe_twist_stream.py` `probe_observer.py`（DDS 流诊断探针，50Hz 流"断流"定责用）
-`peek_status.py`（String 话题旁观器，/veto/status /loc/health 快速回读）`peek_imu.py`（/livox/imu 旁听：频率/模长/与先验法线夹角） |
+| 巡逻栈一键启停（foxy-live 容器内） | `live_stack_start.sh` `live_stack_stop.sh` `probes/pose_dump.py`（位姿连续性检查） `doctor.py`（全链路只读体检：各级速率/健康语义，异常非零退出） |
+| **独立避障否决层**（最后防线，P0-S） | `obstacle_veto.py`（数据流：`/cmd_vel_intent`→speed_adapter→`/cmd_vel_raw`→否决→`/go2/cmd_vel`）`veto_core.py`（G1 无 ROS 决策核心：R1 真距离/R2 不增速/R3 戳闸）`speed_adapter.py`（运动适配器：起步地板 0.25/停步死区，G1 起 veto 不再越权抬速）`bridge_core.py` + `go2_bridge.py` v4（R4 停车锁存仲裁）`test_veto_regression.py`（R1-R4 无 ROS 回归，53 断言）`test_veto_offline.py`（bag 回放集成测试，非零退出码）`e2e_replay_run.sh`（E2E 回放链一键 runner，docker exec -d 脱离会话）`orin_deploy/push_safety.sh`（G1 副本一键推 Orin，狗断电期间改完防忘推）`probes/veto_calib_probe.py`（安装几何标定）`probes/capture_frames.py`（原始帧采集）`veto_status_snoop.py`（Orin 上拉 /veto/status——daemon 瞎）`tf_snoop.py` `probes/veto_selfmask_probe.py`（体素掩膜法，已弃用留档）`probes/probe_twist_stream.py` `archive/probe_observer.py`（DDS 流诊断探针，50Hz 流"断流"定责用）
+`probes/peek_status.py`（String 话题旁观器，/veto/status /loc/health 快速回读）`probes/peek_imu.py`（/livox/imu 旁听：频率/模长/与先验法线夹角） |
 | **R5 定位批回归**（冻结回跳/三态健康/解除迟滞/P0-1 续接//initialpose 重种子/B3 规划器门控） | `r5_replay_regression.sh`（五段 bag 回放一键，**必须 docker exec -d**）→ 宿主机 `python3 r5_verify.py` 断言（R5-1 冻结无回跳 / R5-2 健康 1Hz 心跳数据停后仍在 / R5-3 解除迟滞≥3s / R5-4 拒绝与接受续接 / B3 注入 DEGRADED→清目标零速、恢复不追旧目标）；`r5_capture.py`（采集节点）、`r5_seed_pose.py`（/initialpose 注入器）、`dog_odom_sim.py` |
 | 上电部署件（Orin） | `orin_deploy/push_safety.sh`（安全栈+看门狗一键推）`orin_deploy/livox_watchdog.sh`（驱动长跑塌方自愈：速率塌→SIGINT+清SHM+重拉）`orin_deploy/POWERON_CHECKLIST.md`（上电→可信巡逻检查单） |
-| 相机接入（前摄拍照 RPC + RTSP 流桥） | `go2_photo_test.py` `go2_rtsp_test.py` `go2_camera_bridge.py`（Orin）`go2_camera_republish.py`（工作站）`go2_videohub_probe.py` `con_notify_probe.py` `probe_proto.py` `probe2.py` `describe_rtsp.py` |
+| 相机接入（前摄拍照 RPC + RTSP 流桥） | `go2_photo_test.py` `go2_rtsp_test.py` `go2_camera_bridge.py`（Orin）`go2_camera_republish.py`（工作站）`probes/go2_videohub_probe.py` `probes/con_notify_probe.py` `archive/probe_proto.py` `archive/probe2.py` `probes/describe_rtsp.py` |
 | 雷达启停 / 录包 / 建图 | `start_livox.sh` `stop_livox.sh` `record_bag.sh` `point_lio_start.sh` `test_point_lio.sh` `run_combined_test.sh` |
 | LIO / NDT 定位 / 规划（自研 ROS2 包装） | `point_lio_ros2/` `scan_planner_ros2/` `src/livox_ros_driver2`（msg-only 补丁版） |
 | FAST_LIO（hku-mars 基础上的本地版：IMU 无姿态导出兼容、离线 HBA 扫描导出工具） | `FAST_LIO/`（源码快照，未含 doc/PCD/build，GPL-2.0） |
 | HBA 离线回环优化（hku-mars 基础上的本地修改） | `HBA/`（源码快照，未含 data/build，GPL-2.0）；gtsam 4.1.1 已附带在 `HBA/3rdparty/gtsam`（源码快照，剔除 .git 与构建产物，BSD） |
-| 精度评估 / 地图绘图 / 可视化辅助 | `eval_loc.py` `plot_map.py` `prep_map_viz.py` `viz_helper.py` |
+| 精度评估 / 地图绘图 / 可视化辅助 | `probes/eval_loc.py` `plot_map.py` `probes/prep_map_viz.py` `viz_helper.py` |
 | RViz 巡逻台配置 | `live_stack.rviz`（2D Goal Pose 遛狗 + 相机画面）`livox.rviz` `point_lio.rviz` |
 | DDS 传输配置 | `fastdds_udp_only.xml` `cyclonedds_eth1.xml` |
 | 网络侦察工具 | `scan_ports.py` |
+| 导航操作工具 | `g4_goal_pub.py`（发目标：**先等 get_subscription_count>0 再发**——毒包风暴下规划器参与者约 1-2 分钟后不再接新 pub 匹配，发不进就重启 planner 再发）`initialpose_pub.py`（/initialpose 重种子，**必须 PoseWithCovarianceStamped**，发 PoseStamped 是静默不投递）`goal_loop.py`（巡航循环）`creep_test.py`（蠕行测试）`go2_avoid_switch.py`（自带避障开关：每次狗上电复位成开，实弹前必查必关；**2026-11-06 起在 Orin 上 segfault 待修**） |
+| 只读诊断探针（54 个，`probes/`） | 一次性只读诊断全在此：`health_pose_probe.py`（健康+位姿一行）`hz_any.py`/`lag_probe.py`（频率/戳龄）`self_cluster_probe.py`/`cloud_dogcell_probe.py`（点云自簇/狗格解剖）`match_probe.py`（DDS 端点匹配判定）`veto_calib_probe.py`（安装几何标定）`bbs_*`（3D-BBS 冷启动采集/种子）`wire_probe.py`+`wire_logger.py`+`analyze_dual.py`（双通道对照）`peek_*`（电池/IMU/状态旁听）`api_snoop.py`/`discover_topics.py`（总线侦察）等 |
+| 结案考古（14 个，`archive/`） | 已结案不再维护：SDK"权限门"调查时代（`sport_lease_probe.py`/`ms_lease_probe.py`/`speed_gate_probe.py`/`select_mode_test.py`/`stack_probe2.py` 等——结论：无权限门，狗起步阈值 0.20-0.25）与 nav/camera 时代一次性探针 |
 
 ## 相机两条数据通路（无需云端密钥）
 
@@ -90,7 +93,7 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 该参与者又只在 eth1 多播、工作站发现不了，故由 Orin 上默认 FastDDS 栈的
 `go2_odom_republish.py` 跨栈透传一次，两段一键启停 `go2_odom_start.sh`。
 离线验证：`dog_odom_sim.py` 四场景（mirror 回归 / drift 切换+解除 / glitch 复位
-不误切 / latchtele 死推中复位保持连续），`pose_dump.py` 复查位姿连续性。
+不误切 / latchtele 死推中复位保持连续），`probes/pose_dump.py` 复查位姿连续性。
 
 ## 独立避障否决层 obstacle_veto（撞车事故防线，2026-11-03）
 
@@ -121,7 +124,7 @@ LIO/定位/规划器。数据流 `scan_planner -r /cmd_vel:=/cmd_vel_intent` →
   **下次上电先跑它再实弹**。
 
 - 几何：Mid360 尾部桅杆**前下斜装 47°**（n_up=[-0.733,0.0001,0.680]，h=0.486m，
-  veto_calib_probe.py 从 campus_map 静止段标定）；频带离地 **0.20-0.75m**（下沿
+  probes/veto_calib_probe.py 从 campus_map 静止段标定）；频带离地 **0.20-0.75m**（下沿
   0.20：场地坡度+标定残差 ±4cm 会把地板壳漏进 0.05-0.15，净空处也永远拦截——
   11-03 实弹诊断）；前方 ±60° <1.0m 拦截（R1 修正后=真米数）、侧后 <0.55m 拦截，
   只消"朝向障碍"的速度分量（保沿墙滑行/脱离），原地转向永不拦（逃生），
