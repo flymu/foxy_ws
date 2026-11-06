@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>obstacle_veto_cpp</name>
+  <version>0.1.0</version>
+  <description>独立避障否决层 C++ 移植（P0-S 最后防线）：veto_core 决策核心（R1 真距离/R2 只抑制不放大/R3 时效闸）+ rclcpp 节点，影子模式对拍切替</description>
+  <maintainer email="flymu@users.noreply.github.com">flymu</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>eigen</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
