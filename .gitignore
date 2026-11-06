@@ -21,3 +21,7 @@ __pycache__/
 
 # R5 回归运行产物(每轮覆盖,不入库)
 logs_r5/
+
+# patrol_console：容器内 pip --target 的依赖目录、前端依赖，不入库
+patrol_console/pydeps/
+patrol_console/web/node_modules/

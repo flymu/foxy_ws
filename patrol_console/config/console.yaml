@@ -1,0 +1,70 @@
+# 巡检平台网页控制台配置（patrol_console，基于上游 robot_console 裁剪）
+# 路径都是 foxy-live 容器内的路径。启动方式：宿主机 bash start_console.sh
+# 配置加载逻辑见 patrol_console/config.py：支持 ${data_root} 展开；--config 启动时
+# 不会叠加 ~/.config 里的用户覆盖文件。
+
+server:
+  host: 0.0.0.0        # 容器是 host 网络，笔记本浏览器直接连 <WS 的 IP>:8000
+  port: 8000
+  # 依赖目录（setup_deps.sh 用 pip --target 建的平铺目录；容器没 ensurepip 建不了真 venv）。
+  # 里面只有 fastapi/uvicorn；rclpy、numpy 用系统的。
+  venv: /home/mu/foxy_ws/patrol_console/pydeps
+  # web_dist 留空 = auto：自动找 patrol_console/web/dist（npm run build 的产物）
+  log_dir: ${data_root}/logs
+
+paths:
+  data_root: /home/mu/foxy_ws/patrol_console/data
+
+# 系统监控页显示的话题频率列表（raw 订阅，只记时间戳，不解析消息）。
+# 只监控小话题和本机（容器内）话题：/livox/points2 是 Orin 发来的 32Mbps 级大流，
+# 从 WS 再订阅一路等于往 WiFi 上再加一路单播（11-04 戳龄积压病的教训），不监控。
+topics:
+  - {name: /cloud_registered, hz: 10, qos: reliable}   # Point-LIO 配准点云（容器内，本地）
+  - {name: /Odometry, hz: 10}                          # Point-LIO 里程计（容器内，本地）
+  - {name: /loc/health, hz: 1}                          # 定位健康（容器内，本地）
+  - {name: /loc/pose, hz: 2}                            # 定位位姿（容器内，本地）
+  - {name: /cmd_vel_intent, hz: 10}                     # 规划器/遥控 共用的意图速度
+  - {name: /cmd_vel_raw, hz: 10}                        # speed_adapter 输出
+  - {name: /go2/cmd_vel, hz: 10}                        # veto 放行后的最终速度（Orin 发来，小）
+  - {name: /veto/status, hz: 1}                         # 否决层状态（Orin 发来，小）
+  - {name: /go2/odom, hz: 25}                           # 狗里程计（桥接，小）
+
+tf_edges: []
+
+# 急停：在 zero_duration 秒里向 cmd_vel_topic 连发零速度，并锁定遥控。
+# 注意这是"软急停"：它压住 /cmd_vel_intent，但若规划器还在发目标速度，压完后会恢复；
+# 巡检自主导航时的硬防线仍是 veto + 看门狗 + 断电（见 docs/PATROL_CONSOLE.md）。
+estop:
+  cmd_vel_topic: /cmd_vel_intent
+  zero_duration: 2.0
+
+# 遥控：网页摇杆 → /cmd_vel_intent → speed_adapter（起步地板 0.25）→ veto → 狗。
+# recommended_v 对应狗的真实速度带：低于 0.20~0.25 m/s 狗会原地假死（11-04 实测）。
+# 规划器在发 /cmd_vel_intent 时遥控自动拒绝（互斥，见 main.py planner_active）。
+teleop:
+  topic: /cmd_vel_intent
+  max_v: 0.4
+  max_w: 1.0
+  recommended_v: [0.25, 0.4]
+  timeout: 0.5
+
+mapping:
+  voxel: 0.1             # 体素地图分辨率（m），增量发给网页的粒度
+  scan_voxel: 0.05       # 当前帧显示用的抽稀
+  scan_max_points: 20000
+  process_rate: 5        # 点云处理上限（Hz），5 Hz 足够把地图建全，省一半 CPU
+  # 各步骤对应的 stacks.yaml 里的进程名。sim/waypoints 在白名单里不存在，
+  # 前端会自动隐藏"仿真"卡片和"自动航点"按钮。
+  stacks:
+    sim: sim
+    slam: point_lio
+    waypoints: waypoints
+  slam_profiles:
+    point_lio:
+      algorithm: Point-LIO
+      frame: camera_init
+      scan_topic: /cloud_registered
+      odom_topic: /Odometry
+      # 不配 save：Point-LIO ROS2 版没有 /map_save 服务，退出时自动把地图写到
+      # map_save_path（见 stacks.yaml），"停止建图"即存图，网页不需要保存按钮。
+  # runs_dir 默认 ${data_root}/runs：每条轨迹的 est.tum / run.json 落在这里
