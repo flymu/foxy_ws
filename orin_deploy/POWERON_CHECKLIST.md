@@ -27,6 +27,9 @@
       `source /opt/ros/foxy/setup.bash && source /home/unitree/unitree_ros2/install/setup.bash &&`
       `export PYTHONPATH=/home/unitree/unitree_ros2/unitree_sdk2_python &&`
       `export LD_LIBRARY_PATH=/home/unitree/cyclonedds_ws/install/cyclonedds/lib`
+      ⚠️ **2026-11-06 起该工具在 Orin 上 SEGFAULT（现场未抓到，原因未明）**——上电后
+      第一件事就是带上 `python3 -X faulthandler` 复现并修好它；修好前**假定避障=ON**：
+      固件会吃掉朝障碍的杆量（表现为"遥控不动"），人肉留余量，别朝障碍遥控。
 - [ ] **1.3 安全栈**：`ssh go2_lan 'bash /home/unitree/patrol_safety_start.sh [viz]'`（relay+veto）
       验证：`timeout -s INT 4 ros2 topic echo /veto/status --once`
 - [ ] **1.4 看门狗**（11-06 改序：必须在 relay 之后！它探 /livox/points2，relay 没起会
@@ -45,7 +48,15 @@
 
 - [ ] **2.1** 起 WS 巡检栈：`sg docker -c 'docker exec foxy-live bash /home/mu/foxy_ws/live_stack_start.sh'`
 - [ ] **2.2 重定位**（point_lio 位姿已脏，禁直接导航）：
+      - ⚠️ **2026-11-07 晚 loc_state 已中性化**（断电前 LIO 静态滑走→NDT 假盆地，
+        落盘 t_mo 是毒的，详见 `/home/mu/maps/LOC_STATE_中性化说明_1107.md`）——
+        **本次上电 [resume] 不会触发，直接走冷启动**：
+        BBS 种子 → `/initialpose` 注入（必须 PoseWithCovarianceStamped）→
+        盯 loc 日志 **fitness ≤ 0.01 才算真盆地**（0.05+ = 假盆地，健康门 OK 不算数）。
+      - 若狗没搬走仍趴原位，可省 BBS 直接用真值趴位手动种子：
+        (0.202, -0.077, -0.004) yaw -6.0°（11-06 晚断电前健康窗口末值）。
       - 自动续接（P0-1）：狗没挪窝（<0.5m）时 loc 日志出现 `[resume] ... 续接 T_mo`
+        （本次不适用；恢复续接前提是 loc_state 重新健康落盘）
       - 冷启动/挪窝：等 health=OK 后如定位不对，用 RViz "2D Pose Estimate"（/initialpose）
         或 BBS 种子重播种，日志应出现 `[reseed] T_mo ← /initialpose`
       验证：`timeout 8 ros2 topic echo /loc/health` → `OK|lio_ndt|age` 且不抖
@@ -67,3 +78,8 @@
 - [ ] 看门狗：`ssh go2_wifi 'pkill -f "[l]ivox_watchdog"'`
 - [ ] 桥确认已死（1.5 的铁律）
 - [ ] 位置留档：`/home/mu/maps/loc_state.txt`（loc 每 5s 自动落盘，下次上电续接用）
+- [ ] **断电后（WS 侧）核对 loc_state**（11-07 教训）：断电后 loc 节点会在 WS 上继续
+      每 5s 落盘（数据停不阻断 save_persist）——落盘的是"断电前最后状态"。
+      **断电前 loc 必须处于 fitness 正常的真盆地**；若断电前刚发生看门狗分歧/fitness
+      恶化（>0.05），落盘 t_mo 即为毒，须按 `maps/LOC_STATE_中性化说明_1107.md` 撤文件
+      （停 loc 节点 → 改名出加载路径），否则下次 [resume] 直接吃进假盆地。
