@@ -13,20 +13,33 @@
 
 ## 1. 狗上电，Orin 起来后（顺序即依赖序）
 
-- [ ] **1.1 雷达**：`ssh go2_wifi 'bash -s' < start_livox.sh`
-      验证：`ssh go2_wifi 'timeout 8 ros2 topic hz /livox/points2 --window 20'` ≈10Hz
-- [ ] **1.2 看门狗**：`ssh go2_wifi 'setsid nohup bash /home/unitree/livox_watchdog.sh >/dev/null 2>&1 < /dev/null &'`
-      （只防长跑塌方；人工停雷达它会自动退出告警模式，不拉起）
-- [ ] **1.3 关自带避障**（每次上电必查！固件复位成 ON，开着会朝障碍不动/截停污染测量）：
-      `ssh go2_wifi 'python3 /home/unitree/go2_avoid_switch.py get'` → 必须 off
+- [ ] **1.0 Orin 对时**（11-06 实弹新增，必须在 1.1 之前）：WiFi 模块已拆、狗 LAN 无外网，
+      断电重启后 RTC 回退 ≈8h 且无 NTP 源。**先对时再起雷达**——雷达活着时跳时钟会打疯
+      墙钟定时器（实测 2074Hz 狂喷），垃圾帧流把 point_lio 状态打到 17.8m 游走。
+      `ssh go2_lan 'echo 123 | sudo -S date -s @"'"$(date +%s)"'"'` 然后 `date -u` 核对。
+- [ ] **1.1 雷达**：`ssh go2_lan 'bash -s' < start_livox.sh`
+      验证：`ssh go2_lan 'timeout 8 ros2 topic hz /livox/points2 --window 20'` ≈10Hz
+      （须在 1.4 之后验——points2 是 relay 的输出；rclpy 直读天花板 ~2.5-5Hz 属正常）
+- [ ] **1.2 关自带避障**（每次上电必查！固件复位成 ON，开着会朝障碍不动/截停污染测量）：
+      `ssh go2_lan '...环境见下... python3 /home/unitree/go2_avoid_switch.py get'` → 必须 off
       是 on 就：`... go2_avoid_switch.py off`（巡检期间保持关，veto 是我们的安全层）
-- [ ] **1.4 安全栈**：`ssh go2_wifi 'bash /home/unitree/patrol_safety_start.sh [viz]'`（relay+veto）
+      环境（unitree_sdk2py 走源码树 + cyclonedds 库，缺了报 No module named unitree_sdk2py）：
+      `source /opt/ros/foxy/setup.bash && source /home/unitree/unitree_ros2/install/setup.bash &&`
+      `export PYTHONPATH=/home/unitree/unitree_ros2/unitree_sdk2_python &&`
+      `export LD_LIBRARY_PATH=/home/unitree/cyclonedds_ws/install/cyclonedds/lib`
+- [ ] **1.3 安全栈**：`ssh go2_lan 'bash /home/unitree/patrol_safety_start.sh [viz]'`（relay+veto）
       验证：`timeout -s INT 4 ros2 topic echo /veto/status --once`
+- [ ] **1.4 看门狗**（11-06 改序：必须在 relay 之后！它探 /livox/points2，relay 没起会
+      连数两次空探 30s 误判塌方去重启驱动）：
+      `ssh go2_lan 'setsid nohup bash /home/unitree/livox_watchdog.sh >/dev/null 2>&1 < /dev/null &'`
 - [ ] **1.5 控制桥**（测试时起，测完杀；开着会锁遥控杆量）：
-      `ssh go2_wifi 'bash /home/unitree/go2_bridge_start.sh'`
+      `ssh go2_lan 'bash /home/unitree/go2_bridge_start.sh'`
       验证：`timeout 6 ros2 topic echo /go2/status --once`
-- [ ] **1.6 四足里程计桥**：`ssh go2_wifi 'bash /home/unitree/go2_odom_start.sh'`（两段接力）
+- [ ] **1.6 四足里程计桥**：`ssh go2_lan 'bash /home/unitree/go2_odom_start.sh'`（两段接力）
       验证：`timeout 6 ros2 topic hz /go2/odom`（狗唤醒后才有数据）
+
+> ssh 远程链里 pkill 别写裸进程名（`pkill -f livox_ros_driver2` 会匹配到含同串的会话
+> shell 自身把 ssh 杀断）；一律 `[l]ivox` 括号式。
 
 ## 2. 狗唤醒、牵到建图起点 → 重定位（known-start 或续接）
 
