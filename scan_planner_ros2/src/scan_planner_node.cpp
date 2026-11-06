@@ -169,6 +169,25 @@ private:
 
         pcl::PointCloud<pcl::PointXYZI>::Ptr pc(new pcl::PointCloud<pcl::PointXYZI>);
         pcl::fromROSMsg(*m, *pc);
+        // 11-06: livox 无回波点经中继以 (0,0,0) 存活，Point-LIO 的 PointCloud2 预处理
+        // 不做 blind 过滤 → /cloud_registered 每帧带 ~128 个零值点，注册后正好落在狗自己
+        // 格子上 → A* "the drone is in obstacle" 全军覆没。零值点恒为精确 (0,0,0)，真实
+        // 回波不可能（blind=0.5m 测距下限）；另按 blind 语义丢弃 <0.45m（体原点距离）——
+        // 若零值点随狗移动（body 系原点注册），精确零值检查失效，近距检查兜住。
+        const Eigen::Vector3d sensor_pos = T_odom_body_.translation();
+        pcl::PointCloud<pcl::PointXYZI> cleaned;
+        cleaned.reserve(pc->size());
+        for (const auto &pt : pc->points)
+        {
+            if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+                continue;
+            if (pt.x == 0.0f && pt.y == 0.0f && pt.z == 0.0f)
+                continue;
+            if ((Eigen::Vector3d(pt.x, pt.y, pt.z) - sensor_pos).squaredNorm() < 0.45 * 0.45)
+                continue;
+            cleaned.push_back(pt);
+        }
+        *pc = cleaned;
         pcl::PointCloud<pcl::PointXYZI>::Ptr ds(new pcl::PointCloud<pcl::PointXYZI>);
         pcl::VoxelGrid<pcl::PointXYZI> vg;
         vg.setLeafSize(cloud_vox_, cloud_vox_, cloud_vox_);
