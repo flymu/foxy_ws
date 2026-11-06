@@ -27,9 +27,9 @@
       `source /opt/ros/foxy/setup.bash && source /home/unitree/unitree_ros2/install/setup.bash &&`
       `export PYTHONPATH=/home/unitree/unitree_ros2/unitree_sdk2_python &&`
       `export LD_LIBRARY_PATH=/home/unitree/cyclonedds_ws/install/cyclonedds/lib`
-      ⚠️ **2026-11-06 起该工具在 Orin 上 SEGFAULT（现场未抓到，原因未明）**——上电后
-      第一件事就是带上 `python3 -X faulthandler` 复现并修好它；修好前**假定避障=ON**：
-      固件会吃掉朝障碍的杆量（表现为"遥控不动"），人肉留余量，别朝障碍遥控。
+      ⚠️ 11-06 曾报 SEGFAULT，**11-07 用上面完整环境未复现（get/off 各两次全通过）**——
+      上面的 segfault 大概率是当时环境不全所致；若再炸带 `python3 -X faulthandler` 抓现场。
+      每次上电它仍必查必关（固件复位成 ON 不变）。
 - [ ] **1.3 安全栈**：`ssh go2_lan 'bash /home/unitree/patrol_safety_start.sh [viz]'`（relay+veto）
       验证：`timeout -s INT 4 ros2 topic echo /veto/status --once`
 - [ ] **1.4 看门狗**（11-06 改序：必须在 relay 之后！它探 /livox/points2，relay 没起会
@@ -48,13 +48,12 @@
 
 - [ ] **2.1** 起 WS 巡检栈：`sg docker -c 'docker exec foxy-live bash /home/mu/foxy_ws/live_stack_start.sh'`
 - [ ] **2.2 重定位**（point_lio 位姿已脏，禁直接导航）：
-      - ⚠️ **2026-11-07 晚 loc_state 已中性化**（断电前 LIO 静态滑走→NDT 假盆地，
-        落盘 t_mo 是毒的，详见 `/home/mu/maps/LOC_STATE_中性化说明_1107.md`）——
-        **本次上电 [resume] 不会触发，直接走冷启动**：
-        BBS 种子 → `/initialpose` 注入（必须 PoseWithCovarianceStamped）→
-        盯 loc 日志 **fitness ≤ 0.01 才算真盆地**（0.05+ = 假盆地，健康门 OK 不算数）。
-      - 若狗没搬走仍趴原位，可省 BBS 直接用真值趴位手动种子：
-        (0.202, -0.077, -0.004) yaw -6.0°（11-06 晚断电前健康窗口末值）。
+      - **11-07 00:48 起续接候选有效**（狗下电前 loc 全程健康：fitness 0.010→0.018 真盆地，
+        看门狗正确扛过下电瞬变）：狗没挪窝时优先等 `[resume] 续接 T_mo`；
+      - 续接不过（狗被搬走充电/odom 重置）→ 手动种子省 BBS：
+        **趴位 (0.17, -0.13) yaw ≈ -1.3°**（11-07 蠕行后停位，两次独立 NDT 收敛互证）；
+        种子略偏没关系，NDT 会拉回（11-07 实测：隔夜旧种子被 NDT 从 0.5m 外拉回真位）。
+        落地判据 **fitness ≤ 0.02 且稳定**（假盆地特征是 0.05+，健康门 OK 不算数）。
       - 自动续接（P0-1）：狗没挪窝（<0.5m）时 loc 日志出现 `[resume] ... 续接 T_mo`
         （本次不适用；恢复续接前提是 loc_state 重新健康落盘）
       - 冷启动/挪窝：等 health=OK 后如定位不对，用 RViz "2D Pose Estimate"（/initialpose）
