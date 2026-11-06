@@ -689,8 +689,20 @@ private:
             std::lock_guard<std::mutex> lk(t_mo_mutex_);
             if (ok)
             {
-                T_mo_ = T_new;
-                good_matches_++;
+                // P0 修复(11-06 BBS 重种子被踩回旧盆地): NDT 单次 ~1s，期间
+                // reseed/resume/init 可能已改写 T_mo_ —— 本轮结果基于旧猜测，
+                // 提交会把新种子一键踩回旧盆地(漂移=(0.19,-0.39)实测即此)。
+                // 只在 T_mo_ 仍等于猜测时提交；否则丢弃本轮，下轮从新 T_mo 出发。
+                if (T_mo_.matrix().isApprox(guess, 1e-12))
+                {
+                    T_mo_ = T_new;
+                    good_matches_++;
+                }
+                else
+                {
+                    RCLCPP_WARN(get_logger(),
+                                "[match] T_mo 在本轮计算中被改写(reseed/续接/初始化)，丢弃本轮结果");
+                }
             }
             T_mo_after = T_mo_;
             T_mo_init_snap = T_mo_init_; // resume/reseed 会在执行器里改它，读取同锁
