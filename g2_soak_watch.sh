@@ -17,8 +17,10 @@ while true; do
   alive=$(ps -eo stat,cmd | grep "[m]ap_localization_node" | grep -vc "^Z")
   wall=$(awk '/^wall/{print $2}' $STATE 2>/dev/null)
   age=$(( $(date +%s) - ${wall:-0} ))
+  # loc_state 的 t_mo 行=行优先 3x4(12数)：$5=tx $9=ty $13=tz（$6 是 r10=sin(yaw)，
+  # 曾误当 ty 读了 0.254=yaw15° 假报漂移 0.21m——遥测漂移 0.04 才是真值）
   tx=$(awk '/^t_mo/{print $5}' $STATE 2>/dev/null)
-  ty=$(awk '/^t_mo/{print $6}' $STATE 2>/dev/null)
+  ty=$(awk '/^t_mo/{print $9}' $STATE 2>/dev/null)
   d=$(awk -v bx=$BASE_X -v by=$BASE_Y -v x=${tx:-0} -v y=${ty:-0} \
       'BEGIN{printf "%.3f", sqrt((x-bx)^2+(y-by)^2)}')
   flag="OK"
