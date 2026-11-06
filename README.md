@@ -11,7 +11,7 @@ Unitree Go2 EDU + Jetson Orin Nano（狗载，只跑传感器驱动和桥）+ Li
 | 狗控制桥（工作站→cmd_vel→SDK2 RPC） | `go2_bridge.py` `go2_bridge_start.sh`（部署到 Orin）`archive/motion_test.py` |
 | 四足解算位姿桥（固件 /lf/sportmodestate→`/go2/odom`，两段接力） | `go2_odom_bridge.py`（Orin，第1段：cyclone 钉 eth1 直订主板）`go2_odom_republish.py`（第2段：默认 FastDDS 栈跨栈透传给工作站）`go2_odom_start.sh`（两段一键启停）`dog_odom_sim.py`（离线验证器） |
 | 巡逻栈一键启停（foxy-live 容器内） | `live_stack_start.sh` `live_stack_stop.sh` `probes/pose_dump.py`（位姿连续性检查） `doctor.py`（全链路只读体检：各级速率/健康语义，异常非零退出） |
-| **独立避障否决层**（最后防线，P0-S） | `obstacle_veto.py`（数据流：`/cmd_vel_intent`→speed_adapter→`/cmd_vel_raw`→否决→`/go2/cmd_vel`）`veto_core.py`（G1 无 ROS 决策核心：R1 真距离/R2 不增速/R3 戳闸）`speed_adapter.py`（运动适配器：起步地板 0.25/停步死区，G1 起 veto 不再越权抬速）`bridge_core.py` + `go2_bridge.py` v4（R4 停车锁存仲裁）`test_veto_regression.py`（R1-R4 无 ROS 回归，53 断言）`test_veto_offline.py`（bag 回放集成测试，非零退出码）`e2e_replay_run.sh`（E2E 回放链一键 runner，docker exec -d 脱离会话）`orin_deploy/push_safety.sh`（G1 副本一键推 Orin，狗断电期间改完防忘推）`probes/veto_calib_probe.py`（安装几何标定）`probes/capture_frames.py`（原始帧采集）`veto_status_snoop.py`（Orin 上拉 /veto/status——daemon 瞎）`tf_snoop.py` `probes/veto_selfmask_probe.py`（体素掩膜法，已弃用留档）`probes/probe_twist_stream.py` `archive/probe_observer.py`（DDS 流诊断探针，50Hz 流"断流"定责用）
+| **独立避障否决层**（最后防线，P0-S） | `obstacle_veto.py`（数据流：`/cmd_vel_intent`→speed_adapter→`/cmd_vel_raw`→否决→`/go2/cmd_vel`）`veto_core.py`（G1 无 ROS 决策核心：R1 真距离/R2 不增速/R3 戳闸）`obstacle_veto_cpp/`（C++ 移植 colcon 包，影子对拍已过零 diff，见否决层章节）`veto_shadow_start.sh`/`veto_shadow_diff.py`（C++ 影子启动与对拍工具，Orin 侧）`speed_adapter.py`（运动适配器：起步地板 0.25/停步死区，G1 起 veto 不再越权抬速）`bridge_core.py` + `go2_bridge.py` v4（R4 停车锁存仲裁）`test_veto_regression.py`（R1-R4 无 ROS 回归，53 断言）`test_veto_offline.py`（bag 回放集成测试，非零退出码）`e2e_replay_run.sh`（E2E 回放链一键 runner，docker exec -d 脱离会话）`orin_deploy/push_safety.sh`（G1 副本一键推 Orin，狗断电期间改完防忘推）`probes/veto_calib_probe.py`（安装几何标定）`probes/capture_frames.py`（原始帧采集）`veto_status_snoop.py`（Orin 上拉 /veto/status——daemon 瞎）`tf_snoop.py` `probes/veto_selfmask_probe.py`（体素掩膜法，已弃用留档）`probes/probe_twist_stream.py` `archive/probe_observer.py`（DDS 流诊断探针，50Hz 流"断流"定责用）
 `probes/peek_status.py`（String 话题旁观器，/veto/status /loc/health 快速回读）`probes/peek_imu.py`（/livox/imu 旁听：频率/模长/与先验法线夹角） |
 | **R5 定位批回归**（冻结回跳/三态健康/解除迟滞/P0-1 续接//initialpose 重种子/B3 规划器门控） | `r5_replay_regression.sh`（五段 bag 回放一键，**必须 docker exec -d**）→ 宿主机 `python3 r5_verify.py` 断言（R5-1 冻结无回跳 / R5-2 健康 1Hz 心跳数据停后仍在 / R5-3 解除迟滞≥3s / R5-4 拒绝与接受续接 / B3 注入 DEGRADED→清目标零速、恢复不追旧目标）；`r5_capture.py`（采集节点）、`r5_seed_pose.py`（/initialpose 注入器）、`dog_odom_sim.py` |
 | 上电部署件（Orin） | `orin_deploy/push_safety.sh`（安全栈+看门狗一键推）`orin_deploy/livox_watchdog.sh`（驱动长跑塌方自愈：速率塌→SIGINT+清SHM+重拉）`orin_deploy/POWERON_CHECKLIST.md`（上电→可信巡逻检查单） |
@@ -122,6 +122,21 @@ LIO/定位/规划器。数据流 `scan_planner -r /cmd_vel:=/cmd_vel_intent` →
   首 2s 无云期 100% 零（早启熔断）、bag 停后 100% 零（STALE 熔断），TEST_EXIT=0。
 - `orin_deploy/push_safety.sh`：G1 副本一键 scp 到 Orin——狗断电期间本地改完防忘推，
   **下次上电先跑它再实弹**。
+
+**C++ 移植（2026-11-06 影子先行，已到影子对拍阶段）**：`obstacle_veto_cpp/`
+（colcon 包：`veto_core.hpp` 纯决策核心 + `obstacle_veto_node.cpp` 全状态机节点
++ `test/veto_core_test.cpp`——Python 53 断言中 R1-R3 38 项的同数值移植；
+R4 仲裁 15 项属 bridge 侧不移植）。两侧同断言集全绿=单元级对拍成立
+（WS 容器与 Orin ARM 双构建均 38/38，Python 侧 53/53 未动）。
+影子阶段实弹对照（Orin 真数据、桥已死零运动风险）：`veto_shadow_start.sh`
+（Orin 上起 C++ 影子，输出全部 remap `*_shadow` 不碰生产链）+
+`veto_shadow_diff.py`（/cmd_vel_raw 正弦扫描激励，两版输出 **wz 指纹配对**
+逐对 diff——按时刻就近配对会把 adapter 100Hz 零速流错配成 wz-only 假差异，
+第一轮 1620 个假 mismatch 的教训）。实测 5863 对 **零 mismatch**
+（现场真实 0.19m 障碍持续 BLOCK_SECTOR），标定重试风暴两侧逐字节同构
+（dev≈1.2°/h=0.22 同被校验门拒）。效率：同负载同数据流 30s 平均
+**Python 0.60 核 vs C++ 0.29 核**。切换前待办：行走态实弹复测（对照
+E2E 胶带真值 0.91m 基线）→ `orin_deploy/push_safety.sh` 改推 C++。
 
 - 几何：Mid360 尾部桅杆**前下斜装 47°**（n_up=[-0.733,0.0001,0.680]，h=0.486m，
   probes/veto_calib_probe.py 从 campus_map 静止段标定）；频带离地 **0.20-0.75m**（下沿
