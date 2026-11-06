@@ -47,7 +47,7 @@ class Doctor(Node):
                                          lambda m, t=topic: self.on_odom(t, m), be)
             elif kind == "tw":
                 self.create_subscription(Twist, topic,
-                                         lambda m, t=topic: self.on_tw(t, m), 10)
+                                         lambda m, t=topic: self.on_tw(t, m), be)
             elif kind == "str":
                 self.create_subscription(String, topic,
                                          lambda m, t=topic: self.on_str(t, m), 10)
