@@ -24,6 +24,14 @@ BAG=/home/mu/bags/campus_map
 mkdir -p $R
 rm -f $R/ALL.done
 
+# P0 护栏(11-06 实训): 下方 CLEAN 按进程名 pkill，不分区 domain——若真机栈
+# (live_stack_start.sh 起的三件套, stdout 重定向到 /tmp/live_stack/*.log) 在跑,
+# 会被连坐杀掉。检测有进程持有 live_stack 日志 fd → 拒跑, 先 live_stack_stop.sh。
+if ls -l /proc/[0-9]*/fd 2>/dev/null | grep -q "live_stack"; then
+  echo "[ABORT] 真机栈在跑(有进程持有 /tmp/live_stack/*.log fd)。先 live_stack_stop.sh 再跑回归。" | tee -a $R/ABORT.txt
+  exit 3
+fi
+
 CLEAN() {
   pkill -f "[r]os2 bag play" 2>/dev/null
   pkill -f "[p]oint_lio_node" 2>/dev/null

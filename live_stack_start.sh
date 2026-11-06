@@ -20,7 +20,8 @@ pkill -f "[s]can_planner_node" || true
 pkill -f "[s]peed_adapter" || true
 pkill -f "[o]bstacle_veto" || true   # 只清本机走丢的旧副本（veto 已驻 Orin，勿在本机起）
 pkill -f "[v]iz_helper" || true
-sleep 1
+pkill -f "[g]o2_camera_republish" || true  # 11-06: 不杀它就 rm SHM 会毒化它（Orin 同型事故）
+sleep 3  # 11-06 实弹：上代 LIO 数GB IKD 树要时间释放，杀完 1s 就起新栈会 bad_alloc
 rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port*
 
 source /opt/ros/foxy/setup.bash

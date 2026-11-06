@@ -29,15 +29,18 @@ Z_KEEP = 4.0            # 剥天花板之上保留
 
 
 class ScanDumper(Node):
-    def __init__(self, outdir, windows):
+    def __init__(self, outdir, windows, wlen):
         super().__init__("bbs_scan_dump")
         os.makedirs(outdir, exist_ok=True)
         self.outdir = outdir
         self.windows = list(windows)          # 相对首朵云的秒数
+        self.wlen = wlen                     # 每窗采集时长（狗静止时可加长换密度）
         self.win_idx = 0
         self.t0 = None
         self.buf = []
-        self.qr = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+        # BEST_EFFORT 与 loc/planner 消费者一致；RELIABLE 会让慢 rclpy 读者触发
+        # 重传/背压，实测出现 3s+ 无回调（11-06 live dump 事故：1s 窗只收到 2 帧）
+        self.qr = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(PointCloud2, "/cloud_registered", self.on_cloud, self.qr)
         self.create_subscription(Odometry, "/Odometry", self.on_odom, self.qr)
         self.last_odom = None
@@ -68,7 +71,7 @@ class ScanDumper(Node):
         w = self.windows[self.win_idx]
         if rel < w:
             return
-        if rel <= w + WIN_DUR:
+        if rel <= w + self.wlen:
             self.buf.append(pts)
             return
         # 窗关——落盘
@@ -78,13 +81,13 @@ class ScanDumper(Node):
         self.flush(w, rel, cloud)
         self.win_idx += 1
         # 当前帧可能已属于更晚的窗——递进检查交给下帧；窗口不重叠则无碍
-        if self.win_idx < len(self.windows) and stamp - self.t0 > self.windows[self.win_idx] + WIN_DUR:
+        if self.win_idx < len(self.windows) and stamp - self.t0 > self.windows[self.win_idx] + self.wlen:
             # 稀疏窗口漏采（帧间跳变）：空窗跳过
             self.get_logger().warn(f"窗口 {self.windows[self.win_idx]} 无帧，跳过")
             self.win_idx += 1
 
     def flush(self, w, rel, cloud):
-        name = f"scan_t{w:03d}"
+        name = f"scan_t{int(round(w)):03d}"
         if len(cloud) < 2000:
             self.get_logger().warn(f"{name} 仅 {len(cloud)} 点，丢弃")
             return
@@ -128,14 +131,17 @@ class ScanDumper(Node):
 def main():
     outdir = "/home/mu/bags/bbs_eval"
     windows = [20, 50, 80, 110, 140, 170, 200]
+    wlen = WIN_DUR
     for i, a in enumerate(sys.argv):
         if a == "--windows":
             windows = [float(x) for x in sys.argv[i + 1].split(",")]
         elif a == "--outdir":
             outdir = sys.argv[i + 1]
+        elif a == "--wlen":
+            wlen = float(sys.argv[i + 1])
     rclpy.init()
-    node = ScanDumper(outdir, windows)
-    print(f"[bbs_scan_dump] outdir={outdir} windows={windows}", flush=True)
+    node = ScanDumper(outdir, windows, wlen)
+    print(f"[bbs_scan_dump] outdir={outdir} windows={windows} wlen={wlen}", flush=True)
     while rclpy.ok() and not node.finished():
         rclpy.spin_once(node, timeout_sec=1.0)
     print(f"[bbs_scan_dump] 完成 {node.done}/{len(windows)} 窗", flush=True)

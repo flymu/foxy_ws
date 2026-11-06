@@ -8,9 +8,10 @@ set -e
 cd "$(dirname "$0")/.."
 FILES="obstacle_veto.py veto_core.py veto_viz.py cloud_sparsify.py \
 go2_bridge.py bridge_core.py go2_avoid_switch.py veto_status_snoop.py tf_snoop.py \
-creep_test.py livox_watchdog.sh"
-echo "== 推送: $FILES"
-scp -q $FILES go2_wifi:/home/unitree/
+creep_test.py"
+EXTRA="orin_deploy/livox_watchdog.sh"
+echo "== 推送: $FILES $EXTRA"
+scp -q $FILES $EXTRA go2_wifi:/home/unitree/
 echo "== 完成。下次实弹前的开机检查单："
 echo "  详见 orin_deploy/POWERON_CHECKLIST.md，顺序概要："
 echo "  1. ssh go2_wifi 'bash -s' < start_livox.sh                     # 雷达"
