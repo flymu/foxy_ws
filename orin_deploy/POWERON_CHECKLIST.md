@@ -13,10 +13,13 @@
 
 ## 1. 狗上电，Orin 起来后（顺序即依赖序）
 
-- [ ] **1.0 Orin 对时**（11-06 实弹新增，必须在 1.1 之前）：WiFi 模块已拆、狗 LAN 无外网，
-      断电重启后 RTC 回退 ≈8h 且无 NTP 源。**先对时再起雷达**——雷达活着时跳时钟会打疯
-      墙钟定时器（实测 2074Hz 狂喷），垃圾帧流把 point_lio 状态打到 17.8m 游走。
-      `ssh go2_lan 'echo 123 | sudo -S date -s @"'"$(date +%s)"'"'` 然后 `date -u` 核对。
+- [ ] **1.0 Orin 对时**（必须在 1.1 之前）。11-07 起换了 WiFi 模块（AIC8800DC→littlered 自动连，
+      有外网），**systemd NTP 自同步**：等 WiFi 连上（~30s）后验证
+      `ssh go2_lan 'timedatectl | grep -E "synchronized|NTP service"'` → 须 `synchronized: yes`。
+      仍要"对好时再起雷达"——雷达活着时跳时钟会打疯墙钟定时器（实测 2074Hz 狂喷），
+      垃圾帧流把 point_lio 状态打到 17.8m 游走。WiFi 连不上（断网兜底）才手动：
+      `ssh -t go2_lan "sudo date -s @$(date +%s)"`（-t 交互输 sudo 密码，**密码不写进本仓库**）
+      然后 `ssh go2_lan 'date -u'` 核对。
 - [ ] **1.1 雷达**：`ssh go2_lan 'bash -s' < start_livox.sh`
       验证：`ssh go2_lan 'timeout 8 ros2 topic hz /livox/points2 --window 20'` ≈10Hz
       （须在 1.4 之后验——points2 是 relay 的输出；rclpy 直读天花板 ~2.5-5Hz 属正常）
@@ -31,7 +34,12 @@
       上面的 segfault 大概率是当时环境不全所致；若再炸带 `python3 -X faulthandler` 抓现场。
       每次上电它仍必查必关（固件复位成 ON 不变）。
 - [ ] **1.3 安全栈**：`ssh go2_lan 'bash /home/unitree/patrol_safety_start.sh [viz]'`（relay+veto）
-      验证：`timeout -s INT 4 ros2 topic echo /veto/status --once`
+      验证：`ssh go2_lan 'bash -s' <<< 源码见下` 简化命令：
+      `timeout -s INT 6 ros2 topic echo /veto/status 2>/dev/null | head -2`
+      （⚠️ Foxy 的 echo **没有 --once 参数**——写了会 unrecognized arguments 假报"无流"；
+      靠 timeout 截断取首条即可。判定：出 `state=INIT ... blk=none ...` 行。
+      state 字段恒为 INIT 是正常的——**真正的否决状态在 blk= 字段**（none/SECTOR/POINT），
+      frames/fresh 递增=在消费点云。）
 - [ ] **1.4 看门狗**（11-06 改序：必须在 relay 之后！它探 /livox/points2，relay 没起会
       连数两次空探 30s 误判塌方去重启驱动）：
       `ssh go2_lan 'setsid nohup bash /home/unitree/livox_watchdog.sh >/dev/null 2>&1 < /dev/null &'`
@@ -39,7 +47,11 @@
       `ssh go2_lan 'bash /home/unitree/go2_bridge_start.sh'`
       验证：`timeout 6 ros2 topic echo /go2/status --once`
 - [ ] **1.6 四足里程计桥**：`ssh go2_lan 'bash /home/unitree/go2_odom_start.sh'`（两段接力）
-      验证：`timeout 6 ros2 topic hz /go2/odom`（狗唤醒后才有数据）
+      验证：**看桥日志** `ssh go2_lan 'tail -2 /tmp/go2_odom_bridge.log'` 出 `回传中 ... ~20Hz` 即通
+      （狗趴着静默属正常）。⚠️ 别用 `ros2 topic hz /go2/odom` 验——**/go2/odom 是
+      BEST_EFFORT 而 Foxy 的 hz 默认 RELIABLE 且无 --qos 参数**，QoS 不匹配=永远静默
+      无数据（假象"无流"，11-08 实测 20Hz 在流而 hz 零输出）。rclpy 探针必须
+      `qos_profile_sensor_data`。
 
 > ssh 远程链里 pkill 别写裸进程名（`pkill -f livox_ros_driver2` 会匹配到含同串的会话
 > shell 自身把 ssh 杀断）；一律 `[l]ivox` 括号式。

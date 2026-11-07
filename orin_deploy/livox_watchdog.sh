@@ -21,14 +21,18 @@
 #     （不清 SHM！驱动重启后 relay 靠 DDS 自动重发现恢复订阅）
 #   * 驱动进程不在 → 只告警不拉起（尊重 stop_livox.sh 人工停；看门狗启动时驱动
 #     就不在则直接退出——防误当"自动开机雷达"用）
-#   * 重启后 grace 60s 不判病（驱动初始化慢；11-06 实测传感器重连最长 ~3.5min）
+#   * 重启后 grace 期不判病（驱动初始化慢；11-06 实测传感器重连最长 ~3.5min）
+# 2026-11-07 实弹教训：
+#   * ★GRACE_S=60 < 传感器重连最长 3.5min → 重启后还在重连的驱动被提前处决
+#     （当晚 19:54 重启 #1 仅活 93s 就被 sick=2 杀掉，连环拳放大）。升 240s：
+#     真再塌也最多多等 3min，而假阳处决每次白费一次传感器断电重连。
 # 铁律：unitree 用户跑，绝不 sudo（root 跑 DDS 毒化 SHM 发现）。
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 GOTO_NUM_THREADS=1
 source /opt/ros/foxy/setup.bash
 source ~/livox_ws/install/setup.bash 2>/dev/null
 LOG=/tmp/livox_watchdog.log
 MIN_HZ=3.0
-GRACE_S=60
+GRACE_S=240
 CYCLE_S=15
 SICK_NEEDED=2
 
