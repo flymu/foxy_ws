@@ -46,7 +46,10 @@
 
 ## 2. 狗唤醒、牵到建图起点 → 重定位（known-start 或续接）
 
-- [ ] **2.1** 起 WS 巡检栈：`sg docker -c 'docker exec foxy-live bash /home/mu/foxy_ws/live_stack_start.sh'`
+- [ ] **2.1** 起 WS 巡检栈（两个等价入口，跑同一脚本；11-07 起网页可用）：
+      网页：控制台建图页「巡检栈」卡片「启动」（先确认卡上不是红色"未检测到 Orin 安全栈"——
+      红色=1.3 没起好）；命令行：`sg docker -c 'docker exec foxy-live bash /home/mu/foxy_ws/live_stack_start.sh'`
+      ⚠️ 命令行起的栈网页不能一键停（启动也会被 409 拒），只能命令行停——上电流程统一用一种入口。
 - [ ] **2.2 重定位**（point_lio 位姿已脏，禁直接导航）：
       - **11-07 00:48 起续接候选有效**（狗下电前 loc 全程健康：fitness 0.010→0.018 真盆地，
         看门狗正确扛过下电瞬变）：狗没挪窝时优先等 `[resume] 续接 T_mo`；
@@ -72,7 +75,7 @@
 
 ## 4. 断电前
 
-- [ ] 停 WS 栈：`bash live_stack_stop.sh`（容器内）
+- [ ] 停 WS 栈：网页「巡检栈」卡片「停止」，或 `bash live_stack_stop.sh`（容器内）
 - [ ] Orin 停安全栈：`ssh go2_wifi 'bash /home/unitree/patrol_safety_stop.sh'`
 - [ ] 看门狗：`ssh go2_wifi 'pkill -f "[l]ivox_watchdog"'`
 - [ ] 桥确认已死（1.5 的铁律）

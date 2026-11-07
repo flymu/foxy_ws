@@ -225,6 +225,16 @@ const selectedSlam = computed(() => {
 const slam = computed(() => stackOf(selectedSlam.value?.name ?? names.value.slam))
 const waypoints = computed(() => stackOf(names.value.waypoints))
 const running = (s: StackInfo | null) => s?.state === 'running'
+const active = (s: StackInfo | null) => s?.state === 'running' || s?.state === 'stopping'
+
+// ---------------- 巡检全套栈（live_stack：live_stack_start.sh 的网页入口） ----------------
+const patrol = computed(() => stackOf('live_stack'))
+const slamBusy = computed(() => active(slam.value))           // 巡检栈与 SLAM 卡互斥（都带 Point-LIO）
+const patrolBusy = computed(() => active(patrol.value))
+// Orin 安全栈（livox_relay + obstacle_veto）在不在：veto 在发 /veto/status 就算在。
+// 不在也能起巡检栈（没有 veto 速度根本到不了狗，架构上安全），但规划是空转——提前提示。
+const vetoLive = computed(() =>
+  (store.status?.topics.find((topic) => topic.name === '/veto/status')?.publishers ?? 0) > 0)
 
 const busy = ref<Record<string, boolean>>({})
 async function toggle(s: StackInfo | null, preset?: string) {
@@ -732,6 +742,27 @@ function metricTip(key: string): string | null {
         >{{ running(sim) ? t('mapping.steps.stop') : t('mapping.steps.start') }}</el-button>
       </section>
 
+      <!-- 巡检栈：与步骤 ①② 是两种模式——这是 live_stack_start.sh 的网页入口，
+           起 LIO+定位+规划+speed_adapter 全套跑自主导航；步骤 ① 是纯建图 -->
+      <section class="step patrol" :class="{ current: running(patrol), locked: !running(patrol) }">
+        <header class="step-head">
+          <span class="no"><el-icon :size="14"><Compass /></el-icon></span>
+          <span class="title">{{ t('mapping.patrol.title') }}</span>
+          <span v-if="patrol" class="chip" :class="[STATE_TAG[patrol.state], { live: running(patrol) }]">
+            {{ t(`monitor.state.${patrol.state}`) }}
+          </span>
+        </header>
+        <p class="note">{{ t('mapping.patrol.desc') }}</p>
+        <p class="note" :class="{ bad: !vetoLive }">
+          {{ vetoLive ? t('mapping.patrol.safetyOk') : t('mapping.patrol.safetyMissing') }}
+        </p>
+        <p v-if="running(patrol)" class="note">{{ t('mapping.patrol.runningNote') }}</p>
+        <el-button
+          class="wide" :type="running(patrol) ? 'default' : 'primary'" :loading="!!patrol && busy[patrol.name]"
+          :disabled="!canToggle(patrol, !slamBusy)" @click="toggle(patrol)"
+        >{{ running(patrol) ? t('mapping.steps.stop') : t('mapping.steps.start') }}</el-button>
+      </section>
+
       <!-- ① SLAM（真机上这是第 1 步） -->
       <section class="step" :class="{ current: currentStep === 1, locked: !running(slam) }">
         <header class="step-head">
@@ -755,7 +786,7 @@ function metricTip(key: string): string | null {
         <p v-if="!running(slam)" class="note">{{ t('mapping.steps.needLio') }}</p>
         <el-button
           class="wide" :type="running(slam) ? 'default' : 'primary'" :loading="!!slam && busy[slam.name]"
-          :disabled="!canToggle(slam, true)" @click="toggle(slam)"
+          :disabled="!canToggle(slam, !patrolBusy)" @click="toggle(slam)"
         >{{ running(slam) ? t('mapping.steps.stop') : t('mapping.steps.start') }}</el-button>
       </section>
 
@@ -1353,6 +1384,22 @@ function metricTip(key: string): string | null {
 .step.locked .step-head .title,
 .step.locked .field {
   opacity: 0.6;
+}
+/* 巡检栈：紫色调的"模式"卡（带 LIO+定位+规划全套），与下面两个青色步骤卡区分 */
+.step.patrol {
+  background: rgba(139, 92, 246, 0.07);
+  box-shadow: inset 0 0 0 1px rgba(139, 92, 246, 0.3);
+}
+.step.patrol.current {
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: inset 0 0 0 1px rgba(139, 92, 246, 0.45), 0 8px 22px -14px rgba(139, 92, 246, 0.8);
+}
+.step.patrol.current::before {
+  background: var(--patrol-grad);
+  box-shadow: 0 0 8px rgba(139, 92, 246, 0.8);
+}
+.step.patrol:not(.locked) .no {
+  background: var(--patrol-grad);
 }
 .step-head {
   display: flex;

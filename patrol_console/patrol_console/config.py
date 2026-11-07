@@ -171,6 +171,8 @@ def load(path=None):
         stacks = yaml.safe_load(f) or {}
     for name, spec in stacks.items():
         spec['cmd'] = [expand(a) for a in spec['cmd']]
+        if spec.get('stop_cmd'):      # 停止脚本（live_stack 的 live_stack_stop.sh），同样展开路径
+            spec['stop_cmd'] = [expand(a) for a in spec['stop_cmd']]
         spec['label'] = bilingual(spec.get('label'), name)
         spec['description'] = bilingual(spec.get('description'))
     cfg['stacks'] = stacks

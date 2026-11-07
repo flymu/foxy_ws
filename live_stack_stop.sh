@@ -14,5 +14,9 @@ sleep 2
 pkill -9 -f "[o]bstacle_veto" 2>/dev/null || true   # 同上，只清本机旧副本
 pkill -9 -f "[v]iz_helper" 2>/dev/null || true
 pkill -9 -f "[s]peed_adapter" 2>/dev/null || true
-rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port*
+# 同 live_stack_start.sh：控制台在场时跳过 SHM 清理（删段会把控制台劈进孤代，
+# 见 start 脚本里的 11-07 实测记录）。CLI 恢复流程不带该环境变量，照常清。
+if [ "$LIVE_STACK_KEEP_SHM" != "1" ]; then
+  rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port*
+fi
 echo "存活: $(ps aux | grep -cE '[p]oint_lio_node|[m]ap_localization_node|[s]can_planner_node|[s]peed_adapter|[v]iz_helper') (僵尸进程不计)"

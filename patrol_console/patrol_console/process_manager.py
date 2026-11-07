@@ -20,23 +20,51 @@ from collections import deque
 
 
 def _group_alive(pgid):
+    """进程组里还有活着的进程吗？
+
+    killpg(0) 分不清活人和僵尸：容器 PID1 不收割（/proc 里积了上百个 Z 状态节点，
+    2026-11-06 起持续增长），栈节点退出后以僵尸身份留在组里，killpg(0) 对僵尸照样
+    成功——干净停止被误判成『没停住』，对僵尸白白发 SIGINT/TERM/KILL 共 22 s，
+    还把 stop_cmd 的干净 stage 覆盖成 'sigkill'（2026-11-07 实弹复现：30.61 s，
+    节点其实 3 s 内就全退了）。所以 killpg(0) 成功后再扫一遍 /proc，全僵尸才算死透。
+    """
     try:
-        os.killpg(pgid, 0)          # 信号 0 不做任何事，只检查进程组里还有没有进程
-        return True
+        os.killpg(pgid, 0)          # 信号 0 不做任何事；成功只说明组里还有成员（僵尸也算），
+        #                            # ↓ 不能就此 return True：见下面的 /proc 扫描
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    # 组里还有成员：全部是僵尸才算死透
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f'/proc/{entry}/stat', encoding='utf-8', errors='replace') as f:
+                data = f.read()
+            # comm 可能含空格/括号：state 是最后一个 ')' 之后的第一列，pgrp 是第三列
+            fields = data.rsplit(')', 1)[1].split()
+            if len(fields) < 3 or fields[0] == 'Z':
+                continue
+            if fields[2] == str(pgid):
+                return True
+        except (OSError, IndexError, ValueError):
+            continue
+    return False
 
 
 def _signal_group(pgid, finished, result=None, sigint_wait=10):
     """SIGINT → SIGTERM → SIGKILL，每一步都发给整个进程组，直到 finished() 为真。
+    每级信号发出前先查一次 finished()：已经停干净（stop_cmd 停止的常见结局）就不再发，
+    也不覆盖调用方已写好的 stage。
     返回没能按时退出的记录 [{'code': 'signal_timeout', ...}]。
     result (dict, optional) receives 'stage': the last signal sent ('sigint' / 'sigterm' / 'sigkill'),
     or None when the group was already gone before the first signal.
     sigint_wait: seconds to wait after SIGINT (stacks.yaml stop_timeout; GLIM optimizes and writes its map then)."""
     msgs = []
     for sig, wait in ((signal.SIGINT, sigint_wait), (signal.SIGTERM, 5), (signal.SIGKILL, 2)):
+        if finished():
+            break   # 已经停干净（stop_cmd 路径常见）：别再发信号，也别把 stage 覆盖掉
         try:
             os.killpg(pgid, sig)
         except ProcessLookupError:
@@ -97,6 +125,9 @@ class Stack:
         self.preset = None          # 最近一次启动时用的场景预设
         self.origin = None          # 从哪个页面启动的（mapping / navigation / monitor），导航页用它判断小车是否刚出生
         self.before_stop = spec.get('before_stop')
+        self.stop_cmd = spec.get('stop_cmd')   # 停止脚本（live_stack_stop.sh）：按节点名有序 pkill + 清 SHM，
+        #                                            比对进程组盲发信号干净；跑完仍活着的进程组回落到组信号
+        self.env = dict(spec.get('env') or {})  # 启动/停止脚本的附加环境变量（随 cmd 与 stop_cmd 传下去）
         self.stop_timeout = float(spec.get('stop_timeout', 10))   # s to wait after SIGINT before SIGTERM
         self.stop_on_estop = bool(spec.get('stop_on_estop', False))
         self.proc = None
@@ -167,7 +198,7 @@ class ProcessManager:
                 raise StackRunning(name)
             stamp = time.strftime('%Y%m%d_%H%M%S')
             s.log_path = os.path.join(self._log_dir, f'{name}_{stamp}.log')
-            env = dict(os.environ, RCUTILS_COLORIZED_OUTPUT='0', PYTHONUNBUFFERED='1')
+            env = dict(os.environ, RCUTILS_COLORIZED_OUTPUT='0', PYTHONUNBUFFERED='1', **s.env)
             cmd = merge_args(s.cmd, extra_args)
             with open(s.log_path, 'wb') as log:
                 s.proc = subprocess.Popen(
@@ -202,8 +233,32 @@ class ProcessManager:
                 msgs.append(self._node.call_trigger(
                     s.before_stop['service'], float(s.before_stop.get('timeout', 15))))
 
-            # 2. SIGINT → SIGTERM → SIGKILL，每一步都发给整个进程组
             pgid = s.proc.pid       # start_new_session=True 时进程组号就是它的 pid
+
+            # 2. 停止脚本（配了 stop_cmd 的栈，如 live_stack → live_stack_stop.sh）：
+            #    按节点名有序 pkill + 清 SHM。live_stack_start.sh nohup 起的节点
+            #    留在监护进程的进程组里，盲发组信号虽然也够得着，但会丢掉脚本里
+            #    的停序（先规划器/适配器，后定位/LIO）和 SHM 清理，所以优先走脚本。
+            if s.stop_cmd:
+                try:
+                    r = subprocess.run(s.stop_cmd, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, timeout=s.stop_timeout + 10,
+                                       env=dict(os.environ, **s.env))
+                    if r.returncode == 0:
+                        result['stage'] = 'stop_cmd'
+                    else:
+                        msgs.append({'code': 'stop_cmd_failed',
+                                     'params': {'returncode': r.returncode, 'text': (r.stdout or '')[-200:]}})
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    msgs.append({'code': 'stop_cmd_failed', 'params': {'reason': repr(e)}})
+                # 脚本停完再给监护进程几秒：它的等待循环最长 2 s 一跳，让它自己退出
+                deadline = time.time() + 6
+                while time.time() < deadline and _group_alive(pgid):
+                    time.sleep(0.2)
+
+            # 3. SIGINT → SIGTERM → SIGKILL，每一步都发给整个进程组（stop_cmd 之后还
+            #    活着的进程组在这里收尾；没配 stop_cmd 的栈直接走这里）
             msgs += _signal_group(pgid, lambda: s.proc.poll() is not None and not _group_alive(pgid), result,
                                   s.stop_timeout)
             try:

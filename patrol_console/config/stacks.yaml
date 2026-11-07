@@ -1,10 +1,16 @@
 # 网页可启停的进程白名单：网页只能按名字启停这里列出的命令，不能传自定义命令。
 # 命令在 foxy-live 容器里执行（控制台进程也在容器里）。
 #
-# ⚠️ 这里只有"纯建图"的 Point-LIO。巡检/导航全套栈（LIO+定位+规划+speed_adapter，
-#    以及配套的看门狗、已知起点等安全件）不要从这里启动，继续用 live_stack_start.sh：
-#    一键脚本带看门狗等安全配套；从这里起全套会漏掉这些件，而且和一键脚本互相不知道
-#    对方在跑，容易双开 LIO（页面上的"话题有多个发布者"警告会提示这一点）。
+# 两条记录，互相互斥（都带 Point-LIO，双开会让建图页地图来回跳，server.py 按
+# slam_profile 强制一次只能跑一个）：
+#   point_lio  — 纯建图（只起 LIO）。
+#   live_stack — 巡检全套栈。⚠️ 不要把全套栈拆成一条条进程加进来：会漏掉一键脚本
+#     里的看门狗等安全配套。这里只包了一层 live_stack_supervisor.sh：跑的还是
+#     live_stack_start.sh 本尊（节点清单改了控制台自动跟着变），停走 live_stack_stop.sh
+#     （有序 pkill + 清 SHM，比盲发组信号干净）。
+# exclusive_progs：启动前扫 /proc，点名进程已在跑就拒绝（409 stack_external）。
+#   live_stack_start.sh 开头会 pkill 旧副本再重起——狗正在自主导航时被网页一击
+#   “启动”杀个回马枪是绝对不想要的，所以命令行（docker exec）起过的栈必须先显式停。
 point_lio:
   label: {zh: Point-LIO 建图, en: Point-LIO mapping}
   description: {zh: 只启动激光惯性里程计，采集新地图用；停止时自动把地图落到 /tmp, en: LIO only, for capturing a new map; stopping it writes the map to /tmp}
@@ -17,3 +23,22 @@ point_lio:
     - map_save_path:=/tmp
   stop_timeout: 15      # SIGINT 后等这么久再 SIGTERM：给退出存图（写 PCD）留时间
   stop_on_estop: false  # 急停不停 LIO（停了就没定位了）
+  exclusive_progs: [point_lio_node]   # 命令行起过 LIO/全套栈时网页不许再点启动
+live_stack:
+  label: {zh: 巡检全套栈, en: Full patrol stack}
+  description: {zh: 一键起 LIO+定位+规划+speed_adapter 全套（live_stack_start.sh），自主导航/巡检用；Orin 侧先跑 patrol_safety_start.sh, en: One-shot full stack (LIO + localization + planner + speed adapter) for autonomous patrol; run patrol_safety_start.sh on the Orin first}
+  cmd:
+    - bash
+    - /home/mu/foxy_ws/patrol_console/scripts/live_stack_supervisor.sh
+  stop_cmd:
+    - bash
+    - /home/mu/foxy_ws/live_stack_stop.sh
+  # 控制台先于栈在跑，起/停脚本里的 rm /dev/shm/fastrtps_port* 必须跳过：
+  # 11-07 实测删段会把 DDS 发现劈成两代，先起的控制台再也发现不了后起的节点
+  #（互斥门失效、点云/健康全瞎）。CLI 恢复流程直跑脚本（不带该变量）照常清 SHM。
+  env:
+    LIVE_STACK_KEEP_SHM: '1'
+  slam_profile: point_lio     # 也带 Point-LIO：启动后建图页切到该画像并开新 epoch；与 point_lio 互斥
+  stop_timeout: 15            # stop_cmd 内部 sleep ≈3s，超时后回落到按进程组发信号
+  stop_on_estop: false        # 急停是软停；全套栈里停掉 LIO 就没定位了，硬防线仍是 veto+看门狗+断电
+  exclusive_progs: [point_lio_node, map_localization_node, scan_planner_node, speed_adapter, viz_helper]

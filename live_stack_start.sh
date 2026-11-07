@@ -22,7 +22,15 @@ pkill -f "[o]bstacle_veto" || true   # 只清本机走丢的旧副本（veto 已
 pkill -f "[v]iz_helper" || true
 pkill -f "[g]o2_camera_republish" || true  # 11-06: 不杀它就 rm SHM 会毒化它（Orin 同型事故）
 sleep 3  # 11-06 实弹：上代 LIO 数GB IKD 树要时间释放，杀完 1s 就起新栈会 bad_alloc
-rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port*
+# SHM 清理（默认开：CLI 恢复流程用，清掉崩死节点留下的段/信号量）。
+# ⚠️ 控制台在场时必须跳过（LIVE_STACK_KEEP_SHM=1，控制台的 stacks.yaml 已配）：
+#    11-07 实测 rm 中途删 /dev/shm/fastrtps_port* 会把新旧参与者的 DDS 发现整个劈成
+#    两代——先起的参与者（控制台/探针）再也发现不了后起的节点（控制台看不到
+#    规划器、点云、健康，互斥门失效）。控制台流程起停都干净（SIGINT），
+#    段用不着重建；栈崩了要恢复就 CLI 直跑本脚本（不带环境变量，rm 会执行）。
+if [ "$LIVE_STACK_KEEP_SHM" != "1" ]; then
+  rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port*
+fi
 
 source /opt/ros/foxy/setup.bash
 source /home/mu/foxy_ws/install_x86/setup.bash
@@ -42,7 +50,9 @@ nohup python3 /home/mu/foxy_ws/speed_adapter.py > $LOG/adapter.log 2>&1 &
 #   起法: ssh go2_wifi 'bash /home/unitree/patrol_safety_start.sh [viz]'
 nohup python3 /home/mu/foxy_ws/viz_helper.py > $LOG/viz.log 2>&1 &
 if ! pgrep -f "[g]o2_camera_republish" > /dev/null; then
-    nohup python3 /home/mu/foxy_ws/go2_camera_republish.py > $LOG/camera.log 2>&1 &
+    # setsid 让它搬出本脚本的进程组：stop.sh 刻意不杀它（"没有才补"的常驻助手），
+    # 留在栈的组里会把停止流程吊死——监护进程等不到"组清空"，退化成 SIGKILL 连坐。
+    nohup setsid python3 /home/mu/foxy_ws/go2_camera_republish.py > $LOG/camera.log 2>&1 &
 fi
 
 sleep 2

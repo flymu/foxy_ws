@@ -12,6 +12,8 @@
   --accent: #0891b2;
   --accent-2: #4f46e5;
   --accent-grad: linear-gradient(135deg, #06b6d4 0%, #2563eb 100%);
+  /* 巡检栈卡片（建图页）：紫色，区别于步骤卡的青色——它是另一种模式，不是流程中的一步 */
+  --patrol-grad: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
   /* 状态色 */
   --ok: #059669;
   --warn: #d97706;

@@ -44,7 +44,8 @@ docker exec -d foxy-live bash -c "setsid bash -c 'source /opt/ros/foxy/setup.bas
 docker exec foxy-live bash -c "pkill -f 'patrol_console[.]main'"      # SIGINT 优雅退出
 docker exec foxy-live bash -c "pkill -f 'synth_publisher[.]py'"
 
-# 冒烟回归（36 断言：REST/WS/二进制帧/导出-历史-载入/体素运行时调整/遥控闭环/急停/互斥门）
+# 冒烟回归（50 断言：REST/WS/二进制帧/导出-历史-载入/体素运行时调整/遥控闭环/急停/互斥门/
+#           巡检栈一键启停闭环/相机 republish 不连坐/收尾 DDS 存活金丝雀）
 docker exec foxy-live bash -c 'source /opt/ros/foxy/setup.bash && \
   export PYTHONPATH=/home/mu/foxy_ws/patrol_console/pydeps:$PYTHONPATH && \
   python3 /home/mu/foxy_ws/patrol_console/tests/ws_probe.py'
@@ -66,15 +67,24 @@ docker exec foxy-live bash -c 'source /opt/ros/foxy/setup.bash && \
 | 「高度切片 / veto 带」（右下） | 只显示 z 在范围内的点（GPU shader 裁剪，不动数据）；「veto 带」一键切到 veto 真正统计的离地 0.20~0.75 m 层，滤掉地板看膝盖高矮物 |
 | 「体素」档位（右下） | 地图去重分辨率运行时可调（0.05/0.1/0.2 m，`POST /api/mapping/voxel`）：只影响之后新扫入的点，已有地图不动。想看清矮物轮廓→调 0.05 后让狗再扫一遍；地图太大卡→调 0.2 |
 | 「导出地图 / 历史地图」（右上） | 内存地图一键落盘 npz+PCD（`data/exports/`）；载入=读回内存查看，新 epoch 自动整图重发。狗断电/控制台重启前先导出，现场不丢 |
+| 「巡检栈」卡片（建图页顶端，紫色） | 一键起**全套巡检栈**：跑的就是 `live_stack_start.sh` 本尊（LIO+定位+规划+speed_adapter；外面套一层监督脚本，让控制台能显示"运行中"直到节点退场），**停止走 `live_stack_stop.sh` 的有序停序**（先规划/适配器、后定位/LIO）。卡上红/绿提示实时检测 Orin 安全栈在不在（`/veto/status` 有没有发布者）——红色时先去狗侧跑 `patrol_safety_start.sh`，没有 veto 规划速度到不了狗。与「① SLAM」互斥（服务端强制） |
 | 「① SLAM」卡片 | 启动**纯 Point-LIO**（stacks.yaml 白名单唯一进程）。停止时 LIO 自动把地图落盘 `/tmp/lio_<时间>_global_map.pcd`（`map_save_path:=/tmp`），**停止建图即存图** |
 | 「② 操控」卡片 | 遥控（摇杆/WASD，10Hz），见下方安全设计 |
 | 系统监控页 | 话题频率/发布者数/节点列表/TF/CPU 内存，话题清单在 console.yaml `topics` |
 | 右上角急停 | 见"急停的边界" |
 
-**规约**：纯建图（采新地图）→ 用控制台「启动」；巡检/导航全套栈（LIO+定位+规划+speed_adapter
-+看门狗等安全件）→ 继续用 `live_stack_start.sh`，控制台只当"看+遥控"用。
-两边互相不知道对方，**同时起两个 LIO 会让地图来回跳**——真发生了页面会弹
-"话题有多个发布者"警告，按提示处理。
+**规约**：纯建图（采新地图）→ 「① SLAM」卡片「启动」；巡检/导航全套栈 → 「巡检栈」卡片一键起，
+或命令行 `docker exec foxy-live bash live_stack_start.sh`（两者跑的是同一个脚本）。
+**网页和命令行互相认账**（11-07 起，服务端强制）：
+
+- 两个卡片带 Point-LIO，服务端按 `slam_profile` 互斥——同时只许一个，第二个 409 拒绝；
+- 命令行（docker exec）起过的栈/节点还在跑时，网页点「启动」会被 409 `stack_external` 拒绝
+  （按 `exclusive_progs` 扫 /proc 判断）。一键脚本开头会 pkill 旧副本再重起，狗正在自主导航时
+  被网页顺手触发等于杀个回马枪，所以**命令行起的必须先显式停**；反过来命令行
+  `live_stack_stop.sh` 停掉节点后，网页状态会自动收敛到"已退出"；
+- 控制台在场时，起/停脚本**跳过 `/dev/shm/fastrtps_port*` 清理**（`LIVE_STACK_KEEP_SHM=1`）：
+  11-07 实测中途删段会把新旧参与者的 DDS 发现劈成两代，控制台从此看不到后起的节点
+  （点云/健康全瞎、互斥门失效）。CLI 恢复流程直跑脚本不带此变量，照常清段。
 
 ## 安全设计（遥控与急停）
 
@@ -127,3 +137,7 @@ fastapi 0.124.4 + uvicorn 0.33.0 在 py3.8 下工作正常（pydeps 里 pip 自�
    等于往 WiFi 加一路单播（11-04 教训）。跨 WiFi 的小话题（veto/status、go2/cmd_vel 等）保留。
 4. **点云处理 5 Hz 上限**（`process_rate`）：体素去重在 WS 上跑，6 核机器留余量；地图大
    （>10⁶ 体素）后浏览器增量收点会有可感的几秒，属正常。
+5. **容器 PID1 不收割僵尸**：栈节点退出后以 Z 状态留在进程组里，`killpg(0)` 对僵尸照样
+   成功。控制台的进程组存活检查已按"全僵尸=死透"处理（`process_manager._group_alive` 扫
+   /proc 状态列）——否则干净停止会被误判成没停住，对僵尸白白发 22 s 信号。僵尸本身无害
+   但会累积，容器重启即清（重启会丢控制台内存态地图，先「导出地图」）。

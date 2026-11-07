@@ -3,7 +3,7 @@
 patrol_console 裁剪版：去掉上游的仿真场景 / 地图库 / 导航 / 航点 / 评测 / 批处理模块
 （它们依赖 lidar_nav、GLIM、map_library 等真机环境没有的包），保留：
   - 建图点云流（体素增量 + 二进制帧，前端 Three.js 渲染）
-  - stacks.yaml 白名单进程启停（本配置里只有 Point-LIO）
+  - stacks.yaml 白名单进程启停（纯建图 Point-LIO；巡检全套栈包了一层 live_stack_supervisor.sh）
   - 遥控（/cmd_vel_intent，经 speed_adapter + veto 安全链）
   - 急停（零速度 + 锁定遥控 + 停 stop_on_estop 的栈）
   - 系统监控（话题频率 / 节点 / TF / CPU 内存）
@@ -66,6 +66,31 @@ def create_app(cfg, node, procs, mapping, teleop):
             raise error(404, 'stack_not_found', name=name)
         return s
 
+    # 带 Point-LIO 的栈：SLAM 画像（point_lio）+ 配了 slam_profile 的（巡检全套栈）。
+    # 同时只能跑一个——双开 LIO 会共享 CPU，建图页地图在两份位姿间来回跳（11-04 实测病）。
+    lio_stacks = set(mapping.profiles) | {
+        n for n, spec in cfg.get('stacks', {}).items() if spec.get('slam_profile')}
+
+    def progs_running(progs):
+        """扫 /proc 找命令行里含这些字符串的进程（exclusive_progs 双开防线）。
+
+        live_stack_start.sh 开头会 pkill 旧副本再重起：狗正在自主导航时，网页点
+        「启动」不能把命令行起的栈杀个回马枪。控制台自己的进程不会命中（互斥门
+        先拦），命中的只可能是 docker exec / 脚本手跑的副本。
+        """
+        hits = []
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                    line = ' '.join(p for p in f.read().decode(errors='replace').split('\0') if p)
+            except OSError:
+                continue
+            if any(prog in line for prog in progs):
+                hits.append(line)
+        return hits
+
     # ---------------- REST ----------------
 
     @app.get('/api/status')
@@ -122,19 +147,26 @@ def create_app(cfg, node, procs, mapping, teleop):
 
     @app.post('/api/stacks/{name}/start')
     def start_stack(name: str, origin: Optional[str] = None):
-        stack_or_404(name)
-        is_slam = name in mapping.profiles
-        if is_slam:
-            # one SLAM at a time: two would share the CPU and the mapping page shows only one
-            other = next((n for n in mapping.profiles if n != name and procs.get(n)
+        s = stack_or_404(name)
+        spec = cfg.get('stacks', {}).get(name, {})
+        # 这个栈带不带 LIO：画像栈（point_lio）直接用自己名字，包装栈（live_stack）
+        # 用 stacks.yaml 里配的 slam_profile——启动后建图页都切到该画像并开新 epoch
+        profile = name if name in mapping.profiles else spec.get('slam_profile')
+        if profile:
+            # LIO 互斥：画像栈和巡检全套栈同时只能跑一个
+            other = next((n for n in lio_stacks if n != name and procs.get(n)
                           and procs.get(n).state() in ('running', 'stopping')), None)
             if other:
                 raise error(409, 'stack_running', name=other)
+            # 双开防线：命令行起的副本控制台看不见，点名进程还在跑就拒绝
+            hits = progs_running(spec.get('exclusive_progs') or [])
+            if hits:
+                raise error(409, 'stack_external', name=name, progs=[h[:80] for h in hits[:3]])
         try:
             info = procs.start(name, [], None, origin if origin in ('mapping', 'monitor') else 'monitor')
-            if is_slam:
-                mapping.select(name)
-                mapping.reset()       # 每次开始建图都从空地图开始
+            if profile:
+                mapping.select(profile)
+                mapping.reset()       # 每次开新会话都从空地图看本趟（巡检栈的 LIO 同样发 /cloud_registered）
             return info
         except StackRunning:
             raise error(409, 'stack_running', name=name)
