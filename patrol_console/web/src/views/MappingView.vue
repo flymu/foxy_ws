@@ -183,6 +183,24 @@ function fmtWall(wall: number): string {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+// ---------------- 体素分辨率（运行时可调） ----------------
+// 档位（m）。当前值以状态帧上报的为准（改完 0.2s 内状态就会带上新值）；
+// 只影响之后新扫入的点，已有地图不动——要看清矮物就调 0.05 再扫一遍。
+
+const VOXELS = [0.05, 0.1, 0.2]
+const settingVoxel = ref(false)
+async function setVoxel(v: number) {
+  if (settingVoxel.value || (ms.value?.voxel ?? 0.1) === v) return
+  settingVoxel.value = true
+  try {
+    await api.setVoxel(v)
+  } catch (e) {
+    ElMessage.error(errorText(e))
+  } finally {
+    settingVoxel.value = false
+  }
+}
+
 // ---------------- 进程（步骤 ①②③） ----------------
 
 const STATE_TAG: Record<StackState, TagType> = { idle: 'info', running: 'success', stopping: 'warning', exited: 'info' }
@@ -613,6 +631,15 @@ function metricTip(key: string): string | null {
           <div class="size">
             <span class="k">{{ t('mapping.hud.pointSize') }}</span>
             <el-slider v-model="pointSize" :min="0.5" :max="3" :step="0.25" :show-tooltip="false" size="small" />
+          </div>
+          <div class="voxel">
+            <span class="k">{{ t('mapping.hud.voxel') }}<InfoTip :content="t('mapping.tips.voxel')" /></span>
+            <div class="seg">
+              <button
+                v-for="v in VOXELS" :key="v" :class="{ on: (ms?.voxel ?? 0.1) === v }"
+                :disabled="settingVoxel" @click="setVoxel(v)"
+              >{{ v }}</button>
+            </div>
           </div>
           <div v-if="zRange" class="slice">
             <button
@@ -1076,6 +1103,22 @@ function metricTip(key: string): string | null {
 }
 .size .el-slider {
   width: 84px;
+}
+
+/* 体素分辨率档位（右下角）：状态帧上报当前值，点按即改后端 */
+.voxel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.voxel .seg {
+  padding: 2px;
+}
+.voxel .seg button {
+  height: 22px;
+  padding: 0 9px;
+  font-size: 12px;
+  border-radius: 6px;
 }
 
 /* 高度切片行（右下角）：开关 + 「veto 带」一键 + 双端滑条 */

@@ -112,6 +112,14 @@ def create_app(cfg, node, procs, mapping, teleop):
             raise error(500, 'load_failed', reason=repr(e))
         return {'name': name, **info}
 
+    @app.post('/api/mapping/voxel')
+    def set_map_voxel(v: float):
+        # 0.02 以下浏览器端点数爆炸，0.5 以上矮物细节全糊掉
+        if not (0.02 <= v <= 0.5):
+            raise error(400, 'bad_voxel', v=v)
+        mapping.set_voxel(v)
+        return {'voxel': mapping.voxel}
+
     @app.post('/api/stacks/{name}/start')
     def start_stack(name: str, origin: Optional[str] = None):
         stack_or_404(name)

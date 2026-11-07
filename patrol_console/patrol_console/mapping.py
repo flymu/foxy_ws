@@ -372,6 +372,21 @@ class MappingData:
         return {'epoch': epoch, 'voxels': int(len(m)), 'est': int(len(est)),
                 'gt': int(len(gt)), 'pose': pose}
 
+    def set_voxel(self, voxel):
+        """运行时改体素分辨率（网页「体素」档位）。只影响之后新扫入的点：
+        已有地图点原样保留，_keys 按新分辨率重建保证去重连续——调小后狗再扫一遍
+        同一处就能攒下更细的点（0.05 m 看矮物轮廓正合适），调大则之后点数涨得慢。"""
+        with self._lock:
+            if voxel == self.voxel:
+                return
+            self.voxel = float(voxel)
+            if self._map.n:
+                k, _ = voxel_keys(self._map.data[:self._map.n], self.voxel)
+                self._keys = set(k[k >= 0].tolist())
+            self._log.info(
+                f'体素分辨率改为 {self.voxel} m（现有 {self._map.n} 点保留，'
+                f'去重键按新分辨率重建为 {len(self._keys)} 个）')
+
     def export_run(self, directory):
         """在同一把锁内刷新并复制当前运行记录，避免复制到半行轨迹。"""
         import os

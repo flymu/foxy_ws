@@ -44,7 +44,7 @@ docker exec -d foxy-live bash -c "setsid bash -c 'source /opt/ros/foxy/setup.bas
 docker exec foxy-live bash -c "pkill -f 'patrol_console[.]main'"      # SIGINT 优雅退出
 docker exec foxy-live bash -c "pkill -f 'synth_publisher[.]py'"
 
-# 冒烟回归（33 断言：REST/WS/二进制帧/导出-历史-载入/遥控闭环/急停/互斥门）
+# 冒烟回归（36 断言：REST/WS/二进制帧/导出-历史-载入/体素运行时调整/遥控闭环/急停/互斥门）
 docker exec foxy-live bash -c 'source /opt/ros/foxy/setup.bash && \
   export PYTHONPATH=/home/mu/foxy_ws/patrol_console/pydeps:$PYTHONPATH && \
   python3 /home/mu/foxy_ws/patrol_console/tests/ws_probe.py'
@@ -64,9 +64,10 @@ docker exec foxy-live bash -c 'source /opt/ros/foxy/setup.bash && \
 | 建图页 3D 视图 | `/cloud_registered` 体素地图（frame `camera_init`）+ 估计轨迹 + 当前帧 |
 | 「安全窗」图层 | veto 拦截几何叠加在狗身上：前扇区 ±60°@1.0 m（红）、侧后环 0.55 m（橙）、近距圈 1.25 m（灰）、自体屏蔽框，随狗位姿实时转动。排查"神秘障碍"时开着它看 veto 到底在拦哪块 |
 | 「高度切片 / veto 带」（右下） | 只显示 z 在范围内的点（GPU shader 裁剪，不动数据）；「veto 带」一键切到 veto 真正统计的离地 0.20~0.75 m 层，滤掉地板看膝盖高矮物 |
+| 「体素」档位（右下） | 地图去重分辨率运行时可调（0.05/0.1/0.2 m，`POST /api/mapping/voxel`）：只影响之后新扫入的点，已有地图不动。想看清矮物轮廓→调 0.05 后让狗再扫一遍；地图太大卡→调 0.2 |
 | 「导出地图 / 历史地图」（右上） | 内存地图一键落盘 npz+PCD（`data/exports/`）；载入=读回内存查看，新 epoch 自动整图重发。狗断电/控制台重启前先导出，现场不丢 |
 | 「① SLAM」卡片 | 启动**纯 Point-LIO**（stacks.yaml 白名单唯一进程）。停止时 LIO 自动把地图落盘 `/tmp/lio_<时间>_global_map.pcd`（`map_save_path:=/tmp`），**停止建图即存图** |
-| 「② 移动」卡片 | 遥控（摇杆/WASD，10Hz），见下方安全设计 |
+| 「② 操控」卡片 | 遥控（摇杆/WASD，10Hz），见下方安全设计 |
 | 系统监控页 | 话题频率/发布者数/节点列表/TF/CPU 内存，话题清单在 console.yaml `topics` |
 | 右上角急停 | 见"急停的边界" |
 

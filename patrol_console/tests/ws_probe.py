@@ -5,6 +5,7 @@
   WS     mapping_reset / mapping 状态字段 / 二进制帧格式与体素连续性
   导出   /api/mapping/export 落盘 npz+PCD、非法名 400、历史列表、
          载入 → epoch 变更 + mapping_reset + 新 epoch 整图重发
+  体素   /api/mapping/voxel 运行时改分辨率（状态帧生效）、非法值 400
   遥控   10Hz 指令落到 /cmd_vel_intent、看门狗 0.5s 自动零速、
          急停锁定、解除、规划器在场时 busy 拒绝（互斥门）
 用法（容器内，已 source ROS，PYTHONPATH 含 pydeps）：
@@ -163,6 +164,25 @@ def main():
               f"reset={reset_epoch}")
         check('载入: 整图重发到位', total_map >= loaded['voxels'],
               f"{total_map}/{loaded['voxels']}")
+
+        # 体素分辨率运行时可调：改 0.05 → 状态帧应上报新值（只影响之后新扫入的点）
+        rest('/api/mapping/voxel?v=0.05', 'POST')
+        vox, deadline = None, time.monotonic() + 5
+        while time.monotonic() < deadline and vox != 0.05:
+            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            if not isinstance(msg, bytes):
+                m = json.loads(msg)
+                if m.get('type') == 'mapping':
+                    vox = m['voxel']
+        check('体素: 运行时改 0.05 状态生效', vox == 0.05, f"voxel={vox}")
+        try:
+            rest('/api/mapping/voxel?v=0.001', 'POST')
+            check('体素: 非法值被拒', False)
+        except urllib.error.HTTPError as e:
+            check('体素: 非法值被拒', e.code == 400
+                  and json.loads(e.read())['detail']['code'] == 'bad_voxel')
+        _, rv = rest('/api/mapping/voxel?v=0.1', 'POST')
+        check('体素: 恢复 0.1', rv == {'voxel': 0.1}, str(rv))
 
     async def teleop_run(ws):
         # 12 条 10Hz 遥控指令 → /cmd_vel_intent 上应看到一串 v≈0.3

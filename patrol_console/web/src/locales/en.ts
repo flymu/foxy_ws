@@ -138,7 +138,7 @@ const en: MessageSchema = {
       loaded: 'Loaded "{name}" ({points} voxels); the view is being re-sent',
     },
     slice: { label: 'z-slice', vetoBand: 'Veto band' },
-    hud: { height: 'Height', pointSize: 'Point size' },
+    hud: { height: 'Height', pointSize: 'Point size', voxel: 'Voxel' },
     waiting: 'Waiting for mapping data ({topic})…',
     waitingHint: 'Start the simulation and mapping; the point cloud map will appear here live',
     offline: 'Backend offline',
@@ -160,7 +160,8 @@ const en: MessageSchema = {
     imu: { ok: 'Initialized', waiting: 'Initializing', idle: 'Not started' },
     // Hover text for the small "i" next to labels
     tips: {
-      voxels: 'Voxels (0.1 m) accumulated from the registered cloud of the SLAM, for display only; not the point count of the saved map.',
+      voxels: 'Voxels accumulated from the registered cloud of the SLAM at the current voxel size (adjustable bottom-right), for display only; not the point count of the saved map.',
+      voxel: 'The dedup grid size of the map: smaller (0.05 m) keeps knee-height outlines but the point count grows much faster; larger saves resources. Only affects newly scanned points — the existing map stays; rescan an area after shrinking to see finer detail.',
       scanHz: 'Rate of the registered cloud from the SLAM, normally close to the lidar frame rate. A clear drop means the SLAM cannot keep up or the simulation has slowed down.',
       odomHz: 'Rate of the pose (odometry) output from the SLAM, normally about the same as the cloud rate.',
       imu: 'After start the SLAM initializes from IMU data (gravity direction and so on) and only then starts mapping; keep the robot still meanwhile.',
@@ -552,6 +553,7 @@ const en: MessageSchema = {
     map_empty: 'The in-memory map is empty; let some points accumulate before exporting',
     export_not_found: 'No archive named {name} found',
     load_failed: 'Loading the archive failed: {reason}',
+    bad_voxel: 'Invalid voxel size: {v} m (allowed 0.02–0.5 m)',
     import_waypoints_unavailable: 'This world has no automatic waypoints; use teleop for mapping',
     import_network: 'Upload connection interrupted. Check the network and backend; verify whether import succeeded before retrying',
     scene_in_use: 'The simulation of world {name} is running; stop it before deleting',

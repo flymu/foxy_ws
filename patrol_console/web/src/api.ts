@@ -96,6 +96,9 @@ export const api = {
   loadExport: (name: string) =>
     request<{ name: string; epoch: number; voxels: number; est: number; gt: number; pose: { x: number; y: number; z: number; yaw: number } | null }>(
       'POST', `/api/mapping/exports/${encodeURIComponent(name)}/load`),
+  /** 运行时改体素分辨率（m）：只影响之后新扫入的点，已有地图不变 */
+  setVoxel: (v: number) =>
+    request<{ voxel: number }>('POST', `/api/mapping/voxel?v=${v}`),
   /** Delete an uploaded scene (custom_*); the backend moves its folder to the scenes trash */
   deleteScene: (preset: string) =>
     request<{ name: string; trash: string }>('DELETE', `/api/mapping/presets/${encodeURIComponent(preset)}`),
