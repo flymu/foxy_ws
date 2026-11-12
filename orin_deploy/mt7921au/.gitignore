@@ -1,0 +1,6 @@
+# 下载产物一律不入库（本仓库是 PUBLIC）
+firmware/
+*.tar.gz
+mt76-build/
+build.log
+rssi_walk_*.csv

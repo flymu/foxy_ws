@@ -1,0 +1,32 @@
+# littlered_5G 连接模板（MT7921AU 用）
+# ⚠️ 这是模板：psk 是占位符，**真实密码只在 Orin 上填**（nmcli 交互或 sed），绝不提交仓库。
+# 首次连接推荐直接在 Orin 上跑（连密码都不落文件也行，下面任选其一）：
+#   nmcli dev wifi connect littlered_5G password '<密码>' ifname <新卡if名>
+# 之后如需固定 IP（README §4 第 2 步）再 nmcli con mod。
+#
+# 本文件只在"nmcli 不好使/要预置 profile"时手动用：
+#   1) scp 本文件到 Orin 后，在 Orin 上 sed 填真实密码
+#   2) sudo cp 到 /etc/NetworkManager/system-connections/
+#   3) sudo nmcli con reload && sudo nmcli con up littlered_5G-mt7921
+
+[connection]
+id=littlered_5G-mt7921
+type=wifi
+autoconnect-priority=10
+
+[wifi]
+mode=infrastructure
+ssid=littlered_5G
+# band=a 锁 5G（mt7921 双带都支持，锁 a 防掉到 2.4G 与 AIC 撞信道）
+band=a
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=__在这里填密码_勿提交__
+
+[ipv4]
+# 初装用 auto；切换固定 IP 用 README §4 的 nmcli con mod（改 manual + .141）
+method=auto
+
+[ipv6]
+method=disabled

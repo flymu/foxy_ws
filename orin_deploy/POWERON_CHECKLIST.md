@@ -13,8 +13,8 @@
 
 ## 1. 狗上电，Orin 起来后（顺序即依赖序）
 
-- [ ] **1.0 Orin 对时**（必须在 1.1 之前）。11-07 起换了 WiFi 模块（AIC8800DC→littlered 自动连，
-      有外网），**systemd NTP 自同步**：等 WiFi 连上（~30s）后验证
+- [ ] **1.0 Orin 对时**（必须在 1.1 之前）。WiFi 模块现为 **MT7921AU 5G**（11-13 装好，
+      自动连 littlered_5G=.141，有外网），**systemd NTP 自同步**：等 WiFi 连上（~30s）后验证
       `ssh go2_lan 'timedatectl | grep -E "synchronized|NTP service"'` → 须 `synchronized: yes`。
       仍要"对好时再起雷达"——雷达活着时跳时钟会打疯墙钟定时器（实测 2074Hz 狂喷），
       垃圾帧流把 point_lio 状态打到 17.8m 游走。WiFi 连不上（断网兜底）才手动：
@@ -74,6 +74,24 @@
       - 冷启动/挪窝：等 health=OK 后如定位不对，用 RViz "2D Pose Estimate"（/initialpose）
         或 BBS 种子重播种，日志应出现 `[reseed] T_mo ← /initialpose`
       验证：`timeout 8 ros2 topic echo /loc/health` → `OK|lio_ndt|age` 且不抖
+- [ ] **2.2b 起栈前后的三条铁律（11-08 晚三连飞换来的）**：
+      - 起栈前**狗静 ≥60s**（LIO IMU 初始化窗口有运动=重力泄漏慢滑，21:15 案）；
+      - 起栈 ~60s 后必查 LIO 日志：`grep -E "lag!|blind" /tmp/live_stack/lio.log` **必须为空**——
+        `(lag!)` = LIO 输入队列丢帧 = **雷达流在 WiFi 上成簇到达**（11-08 判据：2.4G 信道
+        饱和，-custom-msg 大流每订阅者 32Mbps 级 + 200Hz IMU 已贴满 20MHz）。出现即停栈，
+        硬跑必飞位姿；IMU 断供的姊妹病是 LIO 姿态角爆炸（rpy 几十度、瞬移百米级）。
+      - **每次起栈后必须看 fitness 数值 ≤0.02**（健康门 OK 不看 fitness——fitness=696/545
+        时 health 仍 OK 的实锤已有三例）；
+      - 相机中继（/go2/camera/front/compressed，Orin→WS 几 Mbps）在信道吃紧时与雷达流
+        抢容量，巡逻时建议先杀：容器里 `kill $(pgrep -f "[g]o2_camera_republish")`，
+        遥控需要相机时再拉起（重启命令见 patrol_console 说明）。
+      - **5G 网卡 MT7921AU 已装好（11-13）**：驱动 = backports-6.1.145 编的 mt7921u 全家
+        （updates/ shadow，冷启动 udev 自动认领；卡若不枚举=无驱动认领会 wedge，
+        **拔下重插一次**即活）；NM 自动连 **littlered_5G（.141，ch44/80MHz，priority=10）**，
+        掉线退 2.4G 只保遥控。链路门已过：-53dBm 桌旁、UDP 60M 双向丢包 0~0.025%、
+        TCP ~200Mbps（战报+踩坑档案见 `orin_deploy/mt7921au/README_MT7921AU_DAY1.md`）。
+        **剩余验收门：覆盖徒步（rssi_walk_test.sh）+ LIO 实弹（lag! 绝迹/fitness/IMU）+
+        G2~G4，过了才解冻自主巡逻。**
 - [ ] **2.3 体检**：`sg docker -c 'docker exec foxy-live python3 /home/mu/foxy_ws/doctor.py'` 全绿
 
 ## 3. 分级实测（G 门控，逐级放行）
