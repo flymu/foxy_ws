@@ -21,8 +21,12 @@
       `ssh -t go2_lan "sudo date -s @$(date +%s)"`（-t 交互输 sudo 密码，**密码不写进本仓库**）
       然后 `ssh go2_lan 'date -u'` 核对。
 - [ ] **1.1 雷达**：`ssh go2_lan 'bash -s' < start_livox.sh`
-      验证：`ssh go2_lan 'timeout 8 ros2 topic hz /livox/points2 --window 20'` ≈10Hz
-      （须在 1.4 之后验——points2 是 relay 的输出；rclpy 直读天花板 ~2.5-5Hz 属正常）
+      验证（11-13 修正）：`ssh go2_lan 'tail -3 /tmp/livox_relay.log'` 应见
+      `中继: ~10.0 Hz (10s窗) 上帧 ~2万点 戳龄 ~0.11s` 连续稳定。
+      ⚠️ **别用 `ros2 topic hz /livox/points2`**——relay 是 BEST_EFFORT 发布而 Foxy 的
+      hz 默认 RELIABLE 订阅，QoS 不匹配=**永远静默**（11-13 实测聋；/go2/odom 同款坑）。
+      验证须在 1.3 之后做（points2 是 relay 的输出；relay 自身日志=权威测量源）。
+      日志偶见 `bad_alloc caught` = 毒包盾拦下发（预期行为，relay 存活即无恙，11-13 实测）。
 - [ ] **1.2 关自带避障**（每次上电必查！固件复位成 ON，开着会朝障碍不动/截停污染测量）：
       `ssh go2_lan '...环境见下... python3 /home/unitree/go2_avoid_switch.py get'` → 必须 off
       是 on 就：`... go2_avoid_switch.py off`（巡检期间保持关，veto 是我们的安全层）
